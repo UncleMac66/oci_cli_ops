@@ -1,13 +1,13 @@
 **OCI CLI Operations** — Interactive management tool for Oracle Cloud Infrastructure, Kubernetes, and GPU infrastructure.
 
-**Version:** 3.25.66 | **Date:** 2026-03-02 | **Lines:** ~71,000
+**Version:** 3.25.73 | **Date:** 2026-03-04 | **Lines:** ~71,600
 
 ## Overview
 
 `oci_cli_ops.sh` — 71K lines of bash that turns your terminal into a full OCI management console. OCI CLI + kubectl, menu-driven, zero web UI required.
 
 🔥 *Compute* (10 sub-sections)
-Instance lifecycle with K8s cordon/drain/taint/terminate workflows, GPU Memory Fabrics & Clusters with firmware tracking, Capacity Topology with RDMA tree visualization, Custom Images, Instance Pools, Cluster Networks, Compute Hosts, and more
+Instance lifecycle with K8s cordon/drain/taint/terminate workflows, GPU Memory Fabrics & Clusters with firmware tracking, Capacity Topology with RDMA tree visualization, Custom Images, Instance Pools, Cluster Networks, Compute Hosts with impacted component details and recycle status, and more
 
 ⚡ *Kubernetes* (11 diagnostic tools)
 OKE cluster environment + comparison, NVIDIA GPU Stack Health (Operator + DRA), node-level GPU health, XID error scanning, RDMA/NCCL diagnostics, NVMe SMART logs, NVIDIA bug reports, SOS bundles, GPU tolerations, and SSH key distribution via DaemonSet
@@ -106,7 +106,7 @@ Global nav: type `:c`, `:k1`, `:n2`, etc. from any prompt to jump.
 | `c7` | GPU Instance Tagging | ComputeInstanceHostActions namespace and tags |
 | `c8` | Instance Pools | Create, view, and manage instance pools |
 | `c9` | Cluster Networks | View cluster networks and instance details |
-| `c10` | Compute Hosts | Bare-metal host health, state, and topology |
+| `c10` | Compute Hosts | Bare-metal host health, state, topology, impacted component details (`h#` drill-down), recycle status |
 
 **Instance Actions** (`c1` prompt): `i#` (detail), `/` (search), `taint`, `untaint`, `cordon`, `uncordon`, `drain`, `reboot`, `cdt` (Cordon-Drain-Tag-Terminate), `terminate`, `bvr` (Boot Volume Replacement), `brc` (Bulk Run-Command), `p` (properties view), `col` (column picker)
 
@@ -267,6 +267,7 @@ All caches stored in `./cache/` relative to the script. Key caches:
 | GPU Clusters | `gpu_clusters.json` | 5m |
 | Maintenance Events | `maintenance_events.json` | 5m |
 | Compute Hosts | `compute_hosts.json` | 5m |
+| Compute Host Details | `compute_host_detail/*.json` | 5m |
 | Capacity Topology | `capacity_topology_hosts.json` | 5m |
 | OKE Environment | `oke_environment.txt` | 5m |
 | Network Resources | `network_resources.txt` | 5m |
@@ -313,7 +314,7 @@ All create, update, and delete operations:
 | 43669–45305 | Instance Pools & Cluster Networks | Pool and cluster network lifecycle management |
 | 45306–49011 | Operations | Resource Manager, work requests, service limits & quotas |
 | 49012–52929 | Storage | File Storage (FSS), Lustre file systems with Object Storage links |
-| 52930–55354 | Topology & Hosts | Capacity topology, compute hosts, GPU instance tagging |
+| 52930–55654 | Topology & Hosts | Capacity topology, compute hosts (impacted detail fetch, h# drill-down), GPU instance tagging |
 | 55355–58829 | K8s Diagnostics | Storage/network/GPU/RDMA verification, bulk run-command, audit |
 | 58830–62847 | K8s Tools | Bug reports, SOS, GPU tolerations, SSH keys, GPU stack health |
 | 62848–65795 | Instance Config Operations | Create/delete instance configurations |
@@ -355,6 +356,7 @@ Focus can be saved to `variables.sh` via `env` → `s` (save). The current focus
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 3.25.73 | 2026-03-04 | Compute host impacted component details via `compute-host get`, recycle-details, `h#` detail drill-down, parallel detail fetch with progress |
 | 3.25.66 | 2026-03-02 | Compute host RDMA tree: topology counts, fabric tags, aligned OCIDs |
 | 3.25.56 | 2026-03-02 | Audit logs: column visibility system, request action column, search drill-down |
 | 3.25.50 | 2026-03-02 | Renamed to `oci_cli_ops.sh`, compute host GPU fabric tags |
@@ -405,7 +407,7 @@ Sample terminal output for key management screens. All data is sanitized — no 
   │   │   ├── Local Block [8 hosts                     ]  [ocid1.computelocalblock...g7h8i9]
   │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...j0k1l2]  ✓ worker-01
   │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...m3n4o5]  ✓ worker-02
-  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [DEGRADED ]  [ocid1.computehost...p6q7r8]  ✓ worker-03  [Impacted]
+  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [DEGRADED ]  [ocid1.computehost...p6q7r8]  ✓ worker-03  [Impacted: NIC/DOWNTIME HPCRDMA-0002 | FULL_RECYCLE]
   │   │   │   └── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...s9t0u1]  ✓ worker-04
   │   │   ├── Local Block [8 hosts                     ]  [ocid1.computelocalblock...v2w3x4]
   │   │   │   └── ...
@@ -418,6 +420,41 @@ Sample terminal output for key management screens. All data is sanitized — no 
 
   By State:   ACTIVE(46) INACTIVE(2)     By Health:  OK(44) DEGRADED(3) UNHEALTHY(1)
   Total Hosts: 48
+```
+
+### Compute Host Detail (`--manage c,10` → `h#`)
+
+```
+  [Compute Host - computebaremetalhost-p6q7r8]
+  ──────────────────────────────────────────────────────────────────────────────────
+    Display Name:         computebaremetalhost-p6q7r8
+    State:                OCCUPIED
+    Health:               UNHEALTHY
+    Shape:                BM.GPU.H100.8
+    Platform:             GPU_H100-NVL8_S.02
+    Fault Domain:         FAULT-DOMAIN-3
+    Instance:             ocid1.instance.oc1.phx...a1b2c3
+    Has Impacted:         true
+
+  ── Impacted Components ─────────────────────────────────────────────────────────
+    Maintenance Type:     DOWNTIME
+    State:                ACTIVE
+    Customer Impacting:   true
+    ── Components ──
+    1)  NIC       DOWNTIME  HPCRDMA-0002-03  MEDIUM  [impacting]
+    2)  GPU       DOWNTIME  GPUFAIL-0010-01  HIGH    [impacting]
+
+  ── Recycle Details ─────────────────────────────────────────────────────────────
+    Recycle Level:        FULL_RECYCLE
+
+  ── Topology ────────────────────────────────────────────────────────────────────
+    HPC Island:           ocid1.hpcisland.oc1.phx...a1b2c3
+    Network Block:        ocid1.computenetworkblock...d4e5f6
+    Local Block:          ocid1.computelocalblock...g7h8i9
+    GPU Fabric:           ocid1.computegpumemoryfabric...j0k1l2
+  ──────────────────────────────────────────────────────────────────────────────────
+
+  [Compute Host - computebaremetalhost-p6q7r8] q >
 ```
 
 ---
