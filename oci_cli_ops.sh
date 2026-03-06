@@ -430,8 +430,8 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.25.73"
-readonly SCRIPT_VERSION_DATE="2026-03-04"
+readonly SCRIPT_VERSION="3.25.74"
+readonly SCRIPT_VERSION_DATE="2026-03-06"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
 ( umask 077 && mkdir -p "$CACHE_DIR" 2>/dev/null )
@@ -31620,20 +31620,21 @@ _CTOP_SEARCH_INDICES=()
 
 #--------------------------------------------------------------------------------
 # Column metadata — CHOST (Compute Host Views)
-#   10 columns: id(#), name, state, health, shape, platform, ad, fd, instance, hostocid
-#   @1 = per-row state_color, @2 = per-row health_color
+#   15 columns: id(#), name, state, health, impacted, shape, platform, k8s, cordon, taint, pods, ad, fd, hostocid, instance
+#   @1 = per-row state_color, @2 = per-row health_color, @3 = per-row impacted_color
+#   @4 = per-row k8s_color, @5 = per-row cordon_color, @6 = per-row taint_color, @7 = per-row pod_color
 #--------------------------------------------------------------------------------
 _CHOST_COL_CONF="$CHOST_COLUMNS_CONF"
-_CHOST_COL_KEYS=(           "id"     "name"            "state"    "health"   "impacted"  "shape"    "platform"                  "ad"     "fd"     "hostocid"      "instance"     )
-_CHOST_COL_LABELS=(         "#"      "Display Name"    "State"    "Health"   "Impacted"  "Shape"    "Platform"                  "AD"     "FD"     "Host OCID"     "Instance OCID")
-_CHOST_COL_DEFAULT_WIDTHS=( 4        28                10         10         4           18         20                          4        4        98              98             )
-_CHOST_COL_WIDTHS=(         4        28                10         10         4           18         20                          4        4        98              98             )
-_CHOST_COL_ALIGN=(          "-"      "-"               "-"        "-"        "-"         "-"        "-"                         "-"      "-"      "-"             "-"            )
-_CHOST_COL_FMTS=(           "%-4.4s" "%-28.28s"        "%-10.10s" "%-10.10s" "%-4.4s"    "%-18.18s" "%-20.20s"                  "%-4.4s" "%-4.4s" "%-98.98s"      "%-98.98s"     )
-_CHOST_COL_COLORS=(         "YELLOW" "WHITE"           "@1"       "@2"       "@3"        ""         "GRAY"                      "GRAY"   "GRAY"   "YELLOW"        "GRAY"         )
+_CHOST_COL_KEYS=(           "id"     "name"            "state"    "health"   "impacted"  "shape"    "platform"  "k8s"      "cordon"   "taint"     "pods"   "ad"     "fd"     "hostocid"      "instance"     )
+_CHOST_COL_LABELS=(         "#"      "Display Name"    "State"    "Health"   "Impacted"  "Shape"    "Platform"  "K8s"      "Cordon"   "Taint"     "Pods"   "AD"     "FD"     "Host OCID"     "Instance OCID")
+_CHOST_COL_DEFAULT_WIDTHS=( 4        28                10         10         4           18         20          8          8          10          5        4        4        98              98             )
+_CHOST_COL_WIDTHS=(         4        28                10         10         4           18         20          8          8          10          5        4        4        98              98             )
+_CHOST_COL_ALIGN=(          "-"      "-"               "-"        "-"        "-"         "-"        "-"         "-"        "-"        "-"         "-"      "-"      "-"      "-"             "-"            )
+_CHOST_COL_FMTS=(           "%-4.4s" "%-28.28s"        "%-10.10s" "%-10.10s" "%-4.4s"    "%-18.18s" "%-20.20s"  "%-8.8s"   "%-8.8s"   "%-10.10s"  "%-5.5s" "%-4.4s" "%-4.4s" "%-98.98s"      "%-98.98s"     )
+_CHOST_COL_COLORS=(         "YELLOW" "WHITE"           "@1"       "@2"       "@3"        ""         "GRAY"      "@4"       "@5"       "@6"        "@7"     "GRAY"   "GRAY"   "YELLOW"        "GRAY"         )
 _CHOST_COL_LOCKED=( "id" )
-# Columns enabled by default (name and instance disabled; user can toggle via col)
-_CHOST_COL_DEFAULT_ENABLED=( "id" "state" "health" "impacted" "shape" "platform" "ad" "fd" "hostocid" "instance" )
+# Columns enabled by default (name, platform, instance disabled; user can toggle via col)
+_CHOST_COL_DEFAULT_ENABLED=( "id" "state" "health" "impacted" "shape" "k8s" "cordon" "taint" "pods" "ad" "fd" "hostocid" "instance" )
 
 # Format globals — CHOST (Compute Host Views)
 _CHOST_ENABLED_COLS=()
@@ -31646,6 +31647,9 @@ _CHOST_SEARCH_HDR_FMT=""
 _CHOST_SEARCH_HDR_ARGS=()
 _CHOST_SEARCH_SEP_WIDTH=0
 _CHOST_SEARCH_INDICES=()
+# K8s lookup arrays for compute hosts (populated by _ch_fetch_k8s_data)
+declare -gA _CH_K8S_MAP=()
+declare -gA _CH_PODS_MAP=()
 
 #--------------------------------------------------------------------------------
 # Column metadata — FWB (Firmware Bundle Views)
@@ -54744,10 +54748,75 @@ _ch_search_hosts() {
 }
 
 #--------------------------------------------------------------------------------
+# Compute Host — Fetch K8s node data for instance→K8s mapping
+#   Populates global _CH_K8S_MAP and _CH_PODS_MAP associative arrays
+#   _CH_K8S_MAP[instance_ocid] = "nodeName|readyStatus|newNodeTaint|unschedulable|maintenanceTaint"
+#   _CH_PODS_MAP[nodeName] = pod_count
+#--------------------------------------------------------------------------------
+_ch_fetch_k8s_data() {
+    _CH_K8S_MAP=()
+    _CH_PODS_MAP=()
+
+    # Check if kubectl is available
+    command -v kubectl &>/dev/null || return 0
+
+    _step_active "k8s nodes"
+    local _k8s_tmp="${TEMP_DIR}/ch_k8s_nodes_$$" _pods_tmp="${TEMP_DIR}/ch_k8s_pods_$$"
+
+    (kubectl get nodes -o json > "$_k8s_tmp" 2>/dev/null) &
+    local _k8s_pid=$!
+    (kubectl get pods --all-namespaces --field-selector=status.phase=Running \
+        -o custom-columns=NODE:.spec.nodeName --no-headers > "$_pods_tmp" 2>/dev/null) &
+    local _pods_pid=$!
+    wait "$_k8s_pid" 2>/dev/null
+    wait "$_pods_pid" 2>/dev/null
+
+    local _k8s_json
+    _k8s_json=$(cat "$_k8s_tmp" 2>/dev/null)
+    rm -f "$_k8s_tmp"
+
+    if [[ -z "$_k8s_json" || "$_k8s_json" == "null" ]]; then
+        rm -f "$_pods_tmp"
+        _step_complete "k8s nodes(n/a)"
+        return 0
+    fi
+
+    # Build K8s lookup: providerID|nodeName|readyStatus|newNodeTaint|unschedulable|maintenanceTaint
+    local _k8s_lookup
+    _k8s_lookup=$(jq -r '
+        .items[] |
+        (.spec.taints // [] | map(select(.key == "newNode")) | if length > 0 then .[0].effect else "N/A" end) as $newNodeTaint |
+        (.spec.taints // [] | map(select(.key == "Maintenance")) | if length > 0 then .[0].effect else "N/A" end) as $maintenanceTaint |
+        (.spec.unschedulable // false) as $unschedulable |
+        "\(.spec.providerID)|\(.metadata.name)|\(.status.conditions[] | select(.type=="Ready") | .status)|\($newNodeTaint)|\($unschedulable)|\($maintenanceTaint)"
+    ' <<< "$_k8s_json" 2>/dev/null)
+
+    # Map by instance OCID (strip oci:// prefix from providerID)
+    while IFS='|' read -r _kpid _krest; do
+        [[ -z "$_kpid" ]] && continue
+        local _kocid="${_kpid##*/}"
+        [[ -n "$_kocid" ]] && _CH_K8S_MAP["$_kocid"]="${_krest}"
+    done <<< "$_k8s_lookup"
+
+    # Pods per node
+    local _pods_per_node
+    _pods_per_node=$(sort "$_pods_tmp" 2>/dev/null | uniq -c | awk '{print $2"|"$1}')
+    rm -f "$_pods_tmp"
+
+    while IFS='|' read -r _pn _pc; do
+        [[ -n "$_pn" ]] && _CH_PODS_MAP["$_pn"]="$_pc"
+    done <<< "$_pods_per_node"
+
+    local _nc=${#_CH_K8S_MAP[@]}
+    _step_complete "k8s nodes(${_nc})"
+}
+
+#--------------------------------------------------------------------------------
 # Compute Host — Row display helper (shared by all view functions)
 # Reads CHOST cache line fields, resolves display values, prints _col_print_row
 #   Args: idx, pipe-delimited line (already parsed into positional vars)
 #   Globals: CH_INST_NAMES (optional), CH_HOST_MAP (written), CH_OCID_MAP (written), _CH_ROW_COUNT (written)
+#   Globals: _CH_K8S_MAP, _CH_PODS_MAP (read for K8s columns)
 #--------------------------------------------------------------------------------
 _ch_print_host_row() {
     local _idx="$1" display_name="$2" state="$3" health="$4" shape="$5" \
@@ -54804,6 +54873,46 @@ _ch_print_host_row() {
         fd_short="$fd"
     fi
 
+    # ── K8s resolution (from global _CH_K8S_MAP / _CH_PODS_MAP) ──
+    local k8s_status="-" k8s_color="$GRAY"
+    local cordon_status="-" cordon_color="$GRAY"
+    local taint_status="-" taint_color="$GRAY"
+    local pod_count="-" pod_color="$GRAY"
+
+    if [[ "$inst_id" == ocid1.instance.* && -n "${_CH_K8S_MAP[$inst_id]+x}" ]]; then
+        local _k8s_match="${_CH_K8S_MAP[$inst_id]}"
+        local _k8s_node _k8s_ready _k8s_nn_taint _k8s_unsched _k8s_maint_taint
+        IFS='|' read -r _k8s_node _k8s_ready _k8s_nn_taint _k8s_unsched _k8s_maint_taint <<< "$_k8s_match"
+
+        if [[ "$_k8s_ready" == "True" ]]; then
+            k8s_status="Ready"; k8s_color="$GREEN"
+        else
+            k8s_status="NotRdy"; k8s_color="$RED"
+        fi
+
+        if [[ "$_k8s_unsched" == "true" ]]; then
+            cordon_status="Yes"; cordon_color="$YELLOW"
+        fi
+
+        local _has_n="false" _has_m="false"
+        [[ "$_k8s_nn_taint" != "N/A" && -n "$_k8s_nn_taint" ]] && _has_n="true"
+        [[ "$_k8s_maint_taint" != "N/A" && -n "$_k8s_maint_taint" ]] && _has_m="true"
+        if [[ "$_has_n" == "true" && "$_has_m" == "true" ]]; then
+            taint_status="n,m"; taint_color="$CYAN"
+        elif [[ "$_has_n" == "true" ]]; then
+            taint_status="newNode"; taint_color="$CYAN"
+        elif [[ "$_has_m" == "true" ]]; then
+            taint_status="maint"; taint_color="$MAGENTA"
+        fi
+
+        local _node_pods="${_CH_PODS_MAP[$_k8s_node]:-}"
+        if [[ -n "$_node_pods" ]]; then
+            pod_count="$_node_pods"; pod_color="$CYAN"
+        else
+            pod_count="0"; pod_color="$GRAY"
+        fi
+    fi
+
     # Host OCID → h# index mapping (unconditional, always available)
     CH_OCID_MAP[$_idx]="$host_ocid"
 
@@ -54849,7 +54958,8 @@ _ch_print_host_row() {
     fi
 
     _col_print_row "CHOST" "i${_idx}" "$display_name" "$state" "$health" "$impacted_display" "$shape" \
-        "$platform" "$ad_short" "$fd_short" "$host_display" "$inst_display" "$state_color" "$health_color" "$impacted_color"
+        "$platform" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$ad_short" "$fd_short" "$host_display" "$inst_display" \
+        "$state_color" "$health_color" "$impacted_color" "$k8s_color" "$cordon_color" "$taint_color" "$pod_color"
 }
 
 #--------------------------------------------------------------------------------
@@ -55114,6 +55224,12 @@ manage_compute_hosts() {
         if ! grep -q "^instance" "$CHOST_COLUMNS_CONF" 2>/dev/null; then
             echo "instance" >> "$CHOST_COLUMNS_CONF"
         fi
+        # v3.25.74: add K8s columns, remove platform from defaults
+        if ! grep -q "^k8s" "$CHOST_COLUMNS_CONF" 2>/dev/null; then
+            sed -i '/^shape$/a k8s\ncordon\ntaint\npods' "$CHOST_COLUMNS_CONF" 2>/dev/null
+            # Remove platform from enabled list (user can re-enable via col)
+            sed -i '/^platform$/d' "$CHOST_COLUMNS_CONF" 2>/dev/null
+        fi
     fi
 
     while true; do
@@ -55178,6 +55294,7 @@ manage_compute_hosts() {
         #-----------------------------------------------------------------------
         _step_init
         _ch_fetch_impacted_details
+        _ch_fetch_k8s_data
         _step_finish
 
         _CH_IMPACT_LOOKUP="${TEMP_DIR}/ch_impact_lookup_$$.txt"
