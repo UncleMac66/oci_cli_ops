@@ -430,8 +430,8 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.25.74"
-readonly SCRIPT_VERSION_DATE="2026-03-06"
+readonly SCRIPT_VERSION="3.25.96"
+readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
 ( umask 077 && mkdir -p "$CACHE_DIR" 2>/dev/null )
@@ -4735,7 +4735,8 @@ build_announcement_lookup() {
     # Refresh cache if needed
     if ! is_cache_fresh "$ANNOUNCEMENTS_LIST_CACHE"; then
         log_info "Fetching announcements from OCI..."
-        
+        $DEBUG_MODE && echo -e "${GRAY}[DEBUG] oci announce announcements list --compartment-id ${compartment_id##*.} --region $region --lifecycle-state ACTIVE --output json --all${NC}" >&2
+
         if ! timeout 60 oci announce announcements list \
                 --compartment-id "$compartment_id" \
                 --region "$region" \
@@ -4747,74 +4748,87 @@ build_announcement_lookup() {
             rm -f "$ANNOUNCEMENTS_LIST_CACHE"
             return 1
         fi
-        
-        # Fetch details for each announcement in parallel
+    fi
+
+    # Fetch missing announcement details in parallel (runs even when list cache is fresh)
+    if [[ -f "$ANNOUNCEMENTS_LIST_CACHE" && -s "$ANNOUNCEMENTS_LIST_CACHE" ]]; then
         local announcement_ids
         announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
-        
+        local _ann_total _ann_fetch=0 _ann_need=0
+        _ann_total=$(echo "$announcement_ids" | grep -c . 2>/dev/null || echo 0)
+
+        # Count how many detail files are missing
         local ann_id
-        local _ann_pids=()
-        local _ann_batch=0
         while IFS= read -r ann_id; do
             [[ -z "$ann_id" ]] && continue
             local detail_file="${CACHE_DIR}/ann_${ann_id##*.}.json"
-            if [[ ! -f "$detail_file" || ! -s "$detail_file" ]]; then
-                oci announce announcements get --announcement-id "$ann_id" --region "$region" --output json > "$detail_file" 2>/dev/null &
-                _ann_pids+=($!)
-                ((_ann_batch++))
-                if [[ $_ann_batch -ge $OCI_MAX_PARALLEL ]]; then
-                    wait "${_ann_pids[@]}" 2>/dev/null
-                    _ann_pids=()
-                    _ann_batch=0
-                fi
-            fi
+            [[ ! -f "$detail_file" || ! -s "$detail_file" ]] && ((_ann_need++))
         done <<< "$announcement_ids"
-        [[ ${#_ann_pids[@]} -gt 0 ]] && wait "${_ann_pids[@]}"
+
+        # Fetch missing details with progress
+        if [[ $_ann_need -gt 0 ]]; then
+            log_info "Fetching ${_ann_need}/${_ann_total} announcement details..."
+            local _ann_pids=()
+            local _ann_batch=0
+            while IFS= read -r ann_id; do
+                [[ -z "$ann_id" ]] && continue
+                local detail_file="${CACHE_DIR}/ann_${ann_id##*.}.json"
+                if [[ ! -f "$detail_file" || ! -s "$detail_file" ]]; then
+                    $DEBUG_MODE && echo -e "${GRAY}[DEBUG] oci announce announcements get --announcement-id ...${ann_id##*.} --region $region${NC}" >&2
+                    oci announce announcements get --announcement-id "$ann_id" --region "$region" --output json > "$detail_file" 2>/dev/null &
+                    _ann_pids+=($!)
+                    ((_ann_batch++))
+                    ((_ann_fetch++))
+                    if [[ $_ann_batch -ge $OCI_MAX_PARALLEL ]]; then
+                        wait "${_ann_pids[@]}" 2>/dev/null
+                        _ann_pids=()
+                        _ann_batch=0
+                    fi
+                fi
+            done <<< "$announcement_ids"
+            [[ ${#_ann_pids[@]} -gt 0 ]] && wait "${_ann_pids[@]}"
+        fi
+        $DEBUG_MODE && echo -e "${GRAY}[DEBUG] announcements detail: fetched ${_ann_fetch}/${_ann_total} (${_ann_need} missing)${NC}" >&2
     fi
     
     # Process cached announcement details (only ann_*.json files)
+    # Single jq call per file extracts lifecycle, ticket, and all resource/GPU-cluster pairs
     local detail_file
     for detail_file in "$CACHE_DIR"/ann_*.json; do
         [[ ! -f "$detail_file" ]] && continue
-        
-        # Validate JSON has announcement data
-        if ! jq -e '.data.id' "$detail_file" > /dev/null 2>&1; then
-            continue
-        fi
-        
-        # Only process ACTIVE announcements
-        local lifecycle_state
-        lifecycle_state=$(jq -r '.data."lifecycle-state" // "N/A"' "$detail_file")
-        [[ "$lifecycle_state" != "ACTIVE" ]] && continue
-        
-        local reference_ticket
-        reference_ticket=$(jq -r '.data."reference-ticket-number" // "N/A"' "$detail_file")
-        local short_ticket="${reference_ticket:0:8}"
-        
-        # Extract affected resources count
-        local resource_count
-        resource_count=$(jq '.data."affected-resources" | length' "$detail_file" 2>/dev/null) || resource_count=0
-        
-        local i
-        for ((i=0; i<resource_count; i++)); do
-            # Get instance/resource ID
-            local resource_id
-            resource_id=$(jq -r ".data.\"affected-resources\"[$i] | 
-                if .properties then
-                    (.properties[] | select(.name == \"resourceId\" or .name == \"instanceId\") | .value) // null
-                else
-                    (.\"resource-id\" // .\"instance-id\" // null)
-                end" "$detail_file" 2>/dev/null)
-            
-            # Get GPU memory cluster
-            local gpu_mem_cluster
-            gpu_mem_cluster=$(jq -r ".data.\"affected-resources\"[$i] |
-                if .properties then
-                    (.properties[] | select(.name == \"gpuMemoryCluster\") | .value) // null
-                else
+
+        # One jq call extracts everything: line 1 = "lifecycle|ticket", remaining lines = "resourceId|gpuCluster"
+        local _ann_bulk
+        _ann_bulk=$(jq -r '
+            .data as $d |
+            ($d["lifecycle-state"] // "N/A") + "|" + ($d["reference-ticket-number"] // "N/A"),
+            (($d["affected-resources"] // [])[] |
+                (if .properties then
+                    ((.properties // [])[] | select(.name == "resourceId" or .name == "instanceId") | .value) // null
+                 else
+                    (.["resource-id"] // .["instance-id"] // null)
+                 end) as $rid |
+                (if .properties then
+                    ((.properties // [])[] | select(.name == "gpuMemoryCluster") | .value) // null
+                 else
                     null
-                end" "$detail_file" 2>/dev/null)
-            
+                 end) as $gmc |
+                (($rid // "null") + "|" + ($gmc // "null"))
+            )
+        ' "$detail_file" 2>/dev/null) || continue
+        [[ -z "$_ann_bulk" ]] && continue
+
+        # First line: lifecycle|ticket
+        local _ann_header
+        _ann_header=$(head -1 <<< "$_ann_bulk")
+        local _ann_lifecycle _ann_ticket
+        IFS='|' read -r _ann_lifecycle _ann_ticket <<< "$_ann_header"
+        [[ "$_ann_lifecycle" != "ACTIVE" ]] && continue
+        local short_ticket="${_ann_ticket:0:8}"
+
+        # Remaining lines: resourceId|gpuCluster
+        local _ann_line
+        while IFS='|' read -r resource_id gpu_mem_cluster; do
             # Add to instance lookup (avoid duplicates)
             if [[ -n "$resource_id" && "$resource_id" != "null" ]]; then
                 if [[ -z "${INSTANCE_ANNOUNCEMENTS[$resource_id]:-}" ]]; then
@@ -4823,7 +4837,7 @@ build_announcement_lookup() {
                     INSTANCE_ANNOUNCEMENTS[$resource_id]="${INSTANCE_ANNOUNCEMENTS[$resource_id]},$short_ticket"
                 fi
             fi
-            
+
             # Add to GPU memory cluster lookup (avoid duplicates)
             if [[ -n "$gpu_mem_cluster" && "$gpu_mem_cluster" != "null" ]]; then
                 if [[ -z "${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]:-}" ]]; then
@@ -4832,8 +4846,9 @@ build_announcement_lookup() {
                     GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]="${GPU_MEM_CLUSTER_ANNOUNCEMENTS[$gpu_mem_cluster]},$short_ticket"
                 fi
             fi
-        done
+        done <<< "$(tail -n +2 <<< "$_ann_bulk")"
     done
+    $DEBUG_MODE && echo -e "${GRAY}[DEBUG] build_announcement_lookup: INSTANCE_ANNOUNCEMENTS=${#INSTANCE_ANNOUNCEMENTS[@]} GPU_MEM_CLUSTER_ANNOUNCEMENTS=${#GPU_MEM_CLUSTER_ANNOUNCEMENTS[@]} ann_files=$(ls "$CACHE_DIR"/ann_*.json 2>/dev/null | wc -l)${NC}" >&2
 }
 
 #===============================================================================
@@ -9070,18 +9085,36 @@ list_maintenance_events() {
     local force_refresh="${3:-false}"
     local filter_type="${4:-named}"
     local me_view_mode="${5:-compact}"
+    local me_link_announcements="${6:-false}"
     
     echo ""
-    _ui_menu_header "INSTANCE MAINTENANCE EVENTS" \
-        --color "$RED" \
-        --breadcrumb "Operations" "Maintenance" \
-        --cmd "oci compute instance-maintenance-event list --compartment-id \$COMPARTMENT_ID | kubectl get nodes -o json | kubectl get pods --all-namespaces | oci compute instance list | oci compute compute-host list | oci compute compute-gpu-memory-cluster list | oci compute compute-gpu-memory-fabric list | oci compute instance-maintenance-event get --instance-maintenance-event-id \$EVENT_ID (×N filtered)" \
-        --env \
-        --cache \
-        "${MAINT_EVENTS_CACHE}|Maint Events" \
-        "${FAULT_DETAILS_CACHE}|Fault Details" \
-        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
-    echo -e "${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)${NC}"
+    local _me_cmd="oci compute instance-maintenance-event list --compartment-id \$COMPARTMENT_ID | kubectl get nodes -o json | kubectl get pods --all-namespaces | oci compute instance list | oci compute compute-host list | oci compute compute-gpu-memory-cluster list | oci compute compute-gpu-memory-fabric list | oci compute instance-maintenance-event get --instance-maintenance-event-id \$EVENT_ID (×N filtered)"
+    [[ "$me_link_announcements" == "true" ]] && _me_cmd="oci compute instance-maintenance-event list --compartment-id \$COMPARTMENT_ID | kubectl get nodes -o json | kubectl get pods --all-namespaces | oci compute instance list | oci announce announcements list --lifecycle-state ACTIVE | oci announce announcements get (×N) | oci compute compute-host list | oci compute compute-gpu-memory-cluster list | oci compute compute-gpu-memory-fabric list | oci compute instance-maintenance-event get --instance-maintenance-event-id \$EVENT_ID (×N filtered)"
+    if [[ "$me_link_announcements" == "true" ]]; then
+        _ui_menu_header "INSTANCE MAINTENANCE EVENTS" \
+            --color "$RED" \
+            --breadcrumb "Operations" "Maintenance" \
+            --cmd "$_me_cmd" \
+            --env \
+            --cache \
+            "${MAINT_EVENTS_CACHE}|Maint Events" \
+            "${FAULT_DETAILS_CACHE}|Fault Details" \
+            "${ANNOUNCEMENTS_LIST_CACHE}|Announcements" \
+            "${INSTANCE_LIST_CACHE}|Instances"
+    else
+        _ui_menu_header "INSTANCE MAINTENANCE EVENTS" \
+            --color "$RED" \
+            --breadcrumb "Operations" "Maintenance" \
+            --cmd "$_me_cmd" \
+            --env \
+            --cache \
+            "${MAINT_EVENTS_CACHE}|Maint Events" \
+            "${FAULT_DETAILS_CACHE}|Fault Details" \
+            "${INSTANCE_LIST_CACHE}|Instances"
+    fi
+    local _ann_status="${GRAY}OFF${NC}"
+    [[ "$me_link_announcements" == "true" ]] && _ann_status="${GREEN}ON${NC}"
+    echo -e "${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)  Announcements: ${_ann_status} ${GRAY}(type 'ann' to toggle)${NC}"
     case "$filter_type" in
         named)       echo -e "${YELLOW}Filter: Named instances with unhealthy host health${NC}" ;;
         PROCESSING)  echo -e "${YELLOW}Filter: Showing only PROCESSING events${NC}" ;;
@@ -9139,28 +9172,38 @@ list_maintenance_events() {
     _step_complete "Pods"
 
     # Instance lookup: instance_ocid → display_name|shape|state|ad|gpu_mem_cluster
-    _step_active "Instances"
-    local me_inst_temp
+    # Uses shared INSTANCE_LIST_CACHE (same cache as o4 announcements view)
+    local me_inst_temp _me_inst_ct
     me_inst_temp=$(create_temp_file) || return 1
-    oci compute instance list \
-        --compartment-id "$compartment_id" \
-        --region "$region" \
-        --all \
-        --output json 2>/dev/null | jq -r '
+    if is_cache_fresh "$INSTANCE_LIST_CACHE" && [[ -s "$INSTANCE_LIST_CACHE" ]]; then
+        _me_inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _me_inst_ct=0
+        _step_complete "Instances(${_me_inst_ct} cached)"
+    else
+        _step_active "Instances"
+        oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null | _cache_write "$INSTANCE_LIST_CACHE"
+        _me_inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _me_inst_ct=0
+        _step_complete "Instances(${_me_inst_ct})"
+    fi
+    # Extract fields from cache into temp file for _ME_INST builder
+    jq -r '
         .data[] |
         select(.["lifecycle-state"] != "TERMINATED") |
         "\(.id)|\(.["display-name"] // "N/A")|\(.shape // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["freeform-tags"]["oci:compute:gpumemorycluster"] // "N/A")"
-    ' > "$me_inst_temp" 2>/dev/null
-    _step_complete "Instances"
+    ' "$INSTANCE_LIST_CACHE" > "$me_inst_temp" 2>/dev/null
 
-    # Build announcement lookup
-    if is_cache_fresh "$ANNOUNCEMENTS_LIST_CACHE"; then
-        build_announcement_lookup "$compartment_id"
-        _step_complete "Announcements(cached)"
-    else
+    # Build announcement lookup (only when linked)
+    if [[ "$me_link_announcements" == "true" ]]; then
         _step_active "Announcements"
         build_announcement_lookup "$compartment_id"
-        _step_complete "Announcements"
+        if is_cache_fresh "$ANNOUNCEMENTS_LIST_CACHE"; then
+            _step_complete "Announcements(${#INSTANCE_ANNOUNCEMENTS[@]} cached)"
+        else
+            _step_complete "Announcements(${#INSTANCE_ANNOUNCEMENTS[@]})"
+        fi
     fi
 
     # Additional fetches — suppress sub-function spinners (step-progress handles display)
@@ -9191,13 +9234,225 @@ list_maintenance_events() {
     fi
 
     _QUIET_SPINNERS=0
-    _step_finish
+
     #==========================================================================
-    # SECTION 1: Instances Requiring Maintenance Attention
+    # Pre-build associative arrays for O(1) lookups (replaces per-row grep|cut)
+    #==========================================================================
+    declare -A _ME_HOST_HEALTH=()
+    declare -A _ME_HOST_OCID=()
+    if [[ -f "$COMPUTE_HOST_CACHE" ]]; then
+        while IFS='|' read -r _mh1 _mh2 _mh3 _ _ _ _ _mh8 _mh9 _; do
+            [[ "$_mh1" == "#"* || -z "$_mh8" || "$_mh8" == "N/A" ]] && continue
+            _ME_HOST_HEALTH[$_mh8]="$_mh3"
+            [[ -n "$_mh9" && "$_mh9" != "N/A" ]] && _ME_HOST_OCID[$_mh8]="$_mh9"
+        done < "$COMPUTE_HOST_CACHE"
+    fi
+
+    declare -A _ME_INST=()
+    while IFS='|' read -r _mi_ocid _mi_rest; do
+        [[ -z "$_mi_ocid" ]] && continue
+        _ME_INST[$_mi_ocid]="$_mi_rest"
+    done < "$me_inst_temp"
+
+    declare -A _ME_K8S=()
+    while IFS='|' read -r _mk_prov _mk_rest; do
+        [[ -z "$_mk_prov" ]] && continue
+        # providerID contains the instance OCID — extract it
+        local _mk_ocid="$_mk_prov"
+        [[ "$_mk_prov" == *"ocid1."* ]] && _mk_ocid="${_mk_prov##*/}"
+        [[ "$_mk_ocid" == *"ocid1."* ]] && _ME_K8S[$_mk_ocid]="$_mk_rest"
+    done <<< "$me_k8s_lookup"
+
+    declare -A _ME_PODS=()
+    while IFS='|' read -r _mp_node _mp_count; do
+        [[ -z "$_mp_node" ]] && continue
+        _ME_PODS[$_mp_node]="$_mp_count"
+    done <<< "$me_pods_per_node"
+
+    # GPU memory cluster display name: instance OCID → cluster display name
+    declare -A _ME_GPU_CLUSTER=()
+    if [[ -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+        while IFS='|' read -r _gc_inst _gc_cid _gc_name; do
+            [[ "$_gc_inst" == "#"* || -z "$_gc_inst" || -z "$_gc_name" ]] && continue
+            _ME_GPU_CLUSTER[$_gc_inst]="$_gc_name"
+        done < "$INSTANCE_CLUSTER_MAP_CACHE"
+    fi
+
+    #==========================================================================
+    # Pre-build fault detail lookup: event_id → faultId~component~severity~description~impact~recommended
+    # Uses persistent cache file to avoid re-fetching on every display
+    #==========================================================================
+    declare -A ME_FAULT_MAP=()
+
+    # Load from persistent cache first
+    if [[ -f "$FAULT_DETAILS_CACHE" && -s "$FAULT_DETAILS_CACHE" ]]; then
+        while IFS='=' read -r fc_evt_id fc_data; do
+            [[ -z "$fc_evt_id" || "$fc_evt_id" == "#"* ]] && continue
+            [[ -n "$fc_data" && "$fc_data" != "-~-~-~-~-~-" ]] && ME_FAULT_MAP[$fc_evt_id]="$fc_data"
+        done < "$FAULT_DETAILS_CACHE"
+    fi
+
+    # Extract from list response additional-details (flat keys or nested faultDetails)
+    while IFS='~' read -r flt_evt_id flt_fault_id flt_component flt_severity flt_desc flt_impact flt_recommended; do
+        [[ -z "$flt_evt_id" ]] && continue
+        [[ "$flt_fault_id" == "-" && "$flt_component" == "-" && "$flt_severity" == "-" ]] && continue
+        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue  # already in cache
+        ME_FAULT_MAP[$flt_evt_id]="${flt_fault_id}~${flt_component}~${flt_severity}~${flt_desc}~${flt_impact}~${flt_recommended}"
+    done < <(jq -r '
+        .data[] |
+        .id as $eid |
+        (.["additional-details"] // {}) as $ad |
+        (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
+         if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
+         if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
+        ) as $nested |
+        if $nested != null then
+            "\($eid)~\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
+        elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
+            "\($eid)~\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
+        else
+            empty
+        end
+    ' "$cache_file" 2>/dev/null)
+
+    # Parallel fetch for events not yet in cache
+    local fault_temp_dir="${TEMP_DIR}/fault_detail_$$"
+    mkdir -p "$fault_temp_dir" 2>/dev/null
+    local fault_fetch_count=0
+    local fault_fetch_pids=()
+    local fault_total_to_fetch=0
+
+    # Build filtered event ID list based on current filter_type
+    # This avoids fetching fault details for events that won't be displayed
+    local filtered_evt_ids_file
+    filtered_evt_ids_file=$(create_temp_file) || true
+
+    while IFS='|' read -r _filt_id _filt_inst_id _filt_lifecycle _filt_time_finished; do
+        [[ -z "$_filt_id" ]] && continue
+
+        # Apply same filters as the events display table
+        if [[ "$filter_type" == "named" ]]; then
+            local _filt_inst_info="${_ME_INST[$_filt_inst_id]:-}"
+            local _filt_inst_name=""
+            [[ -n "$_filt_inst_info" ]] && _filt_inst_name="${_filt_inst_info%%|*}"
+            [[ -z "$_filt_inst_name" || "$_filt_inst_name" == "N/A" ]] && continue
+            local _filt_cap_topo="${_ME_HOST_HEALTH[$_filt_inst_id]:-N/A}"
+            [[ "$_filt_cap_topo" == "HEALTHY" || "$_filt_cap_topo" == "N/A" ]] && continue
+        elif [[ "$filter_type" == "PROCESSING" || "$filter_type" == "SUCCEEDED" || "$filter_type" == "CANCELED" || "$filter_type" == "SCHEDULED" ]]; then
+            [[ "${_filt_lifecycle^^}" != "${filter_type}" ]] && continue
+        fi
+
+        echo "$_filt_id" >> "$filtered_evt_ids_file"
+    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["lifecycle-state"] // "")|\(.["time-finished"] // "null")"' "$cache_file" 2>/dev/null)
+
+    local filtered_evt_count
+    filtered_evt_count=$(wc -l < "$filtered_evt_ids_file" 2>/dev/null | tr -d ' ')
+    [[ -z "$filtered_evt_count" ]] && filtered_evt_count=0
+
+    # Count how many need fetching (only filtered events)
+    while IFS= read -r flt_evt_id; do
+        [[ -z "$flt_evt_id" ]] && continue
+        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
+        ((fault_total_to_fetch++))
+    done < "$filtered_evt_ids_file"
+
+    if [[ $fault_total_to_fetch -gt 0 ]]; then
+        _step_active "Fault details(0/${fault_total_to_fetch})"
+
+        while IFS= read -r flt_evt_id; do
+            [[ -z "$flt_evt_id" ]] && continue
+            [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
+
+            (
+                local evt_detail
+                evt_detail=$(oci compute instance-maintenance-event get \
+                    --instance-maintenance-event-id "$flt_evt_id" \
+                    --region "$region" \
+                    --output json 2>/dev/null)
+                if [[ -n "$evt_detail" ]]; then
+                    local fault_line
+                    fault_line=$(jq -r '
+                        (.data["additional-details"] // {}) as $ad |
+                        (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
+                         if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
+                         if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
+                        ) as $nested |
+                        if $nested != null then
+                            "\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
+                        elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
+                            "\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
+                        else
+                            "-~-~-~-~-~-"
+                        end
+                    ' <<< "$evt_detail" 2>/dev/null)
+                    if [[ -n "$fault_line" && "$fault_line" != "-~-~-~-~-~-" ]]; then
+                        echo "$fault_line" > "$fault_temp_dir/$flt_evt_id"
+                    fi
+                fi
+            ) >/dev/null 2>&1 &
+            fault_fetch_pids+=($!)
+            ((fault_fetch_count++))
+
+            if [[ $fault_fetch_count -ge 10 ]]; then
+                wait "${fault_fetch_pids[@]}" 2>/dev/null
+                fault_fetch_pids=()
+                fault_fetch_count=0
+            fi
+        done < "$filtered_evt_ids_file"
+
+        [[ ${#fault_fetch_pids[@]} -gt 0 ]] && wait "${fault_fetch_pids[@]}" 2>/dev/null
+    fi
+
+    # Read fetched fault details into ME_FAULT_MAP
+    local fault_found_count=0
+    local cache_updated=false
+    for fault_file in "$fault_temp_dir"/*; do
+        [[ ! -f "$fault_file" ]] && continue
+        local f_evt_id
+        f_evt_id=$(basename "$fault_file")
+        local f_data
+        f_data=$(cat "$fault_file" 2>/dev/null)
+        if [[ -n "$f_data" && "$f_data" != "-~-~-~-~-~-" ]]; then
+            ME_FAULT_MAP[$f_evt_id]="$f_data"
+            ((fault_found_count++))
+            cache_updated=true
+        fi
+    done
+    rm -rf "${fault_temp_dir:?}" 2>/dev/null
+
+    # Build filtered event set for O(1) skip in display pass
+    declare -A _ME_FILTERED_EVTS=()
+    if [[ -f "$filtered_evt_ids_file" ]]; then
+        while IFS= read -r _fe_id; do
+            [[ -n "$_fe_id" ]] && _ME_FILTERED_EVTS[$_fe_id]=1
+        done < "$filtered_evt_ids_file"
+    fi
+    rm -f "$filtered_evt_ids_file" 2>/dev/null
+
+    # Show fault details as discovery step
+    if [[ $fault_total_to_fetch -gt 0 ]]; then
+        _step_complete "Fault details(${fault_found_count}/${fault_total_to_fetch})"
+    elif [[ ${#ME_FAULT_MAP[@]} -gt 0 ]]; then
+        _step_complete "Fault details(${#ME_FAULT_MAP[@]} cached)"
+    fi
+
+    _step_finish
+
+    # Persist fault cache to disk (write full map)
+    if [[ "$cache_updated" == "true" || ! -f "$FAULT_DETAILS_CACHE" ]]; then
+        {
+            echo "# Fault details cache - event_id=faultId~component~severity~description~impact~recommended"
+            for fc_key in "${!ME_FAULT_MAP[@]}"; do
+                echo "${fc_key}=${ME_FAULT_MAP[$fc_key]}"
+            done
+        } | _cache_write "$FAULT_DETAILS_CACHE"
+    fi
+
+    #==========================================================================
+    # SECTION 1: Instance Maintenances — instances with unhealthy host health
     #==========================================================================
     echo ""
-    _ui_menu_header "INSTANCES REQUIRING MAINTENANCE ATTENTION" \
-        --breadcrumb "Operations" "Maintenance" "Attention Required"
+    _ui_subheader "Instance Maintenances" 0
     echo -e "${GRAY}Showing instances with: unhealthy compute host health state${NC}"
     echo ""
 
@@ -9218,9 +9473,7 @@ list_maintenance_events() {
             continue
         fi
         
-        local mi_cap_topo
-        mi_cap_topo=$(get_compute_host_health "$mi_ocid")
-        [[ -z "$mi_cap_topo" ]] && mi_cap_topo="N/A"
+        local mi_cap_topo="${_ME_HOST_HEALTH[$mi_ocid]:-N/A}"
 
         local mi_ann
         mi_ann=$(get_resource_announcements "$mi_ocid" "$mi_gpu_mem")
@@ -9231,20 +9484,14 @@ list_maintenance_events() {
         [[ "$mi_ann" != "-" && -n "$mi_ann" ]] && mi_needs="true"
         [[ "$mi_needs" != "true" ]] && continue
         
-        # K8s info from shared lookup
+        # K8s info from pre-built lookup
         local mi_k8s_node="N/A" mi_k8s_ready="N/A" mi_k8s_cordon="-" mi_k8s_pods="-" mi_k8s_serial="N/A"
-        local mi_k8s_info
-        mi_k8s_info=$(echo "$me_k8s_lookup" | grep -F "$mi_ocid" 2>/dev/null)
+        local mi_k8s_info="${_ME_K8S[$mi_ocid]:-}"
         if [[ -n "$mi_k8s_info" ]]; then
-            mi_k8s_node=$(echo "$mi_k8s_info" | cut -d'|' -f2)
-            mi_k8s_ready=$(echo "$mi_k8s_info" | cut -d'|' -f3)
-            local mi_unsched
-            mi_unsched=$(echo "$mi_k8s_info" | cut -d'|' -f4)
-            mi_k8s_serial=$(echo "$mi_k8s_info" | cut -d'|' -f7)
+            local mi_unsched mi_tc mi_tn
+            IFS='|' read -r mi_k8s_node mi_k8s_ready mi_unsched mi_tc mi_tn mi_k8s_serial <<< "$mi_k8s_info"
             [[ "$mi_unsched" == "true" ]] && mi_k8s_cordon="Yes"
-            local mi_node_pods
-            mi_node_pods=$(echo "$me_pods_per_node" | grep "^${mi_k8s_node}|" | cut -d'|' -f2)
-            mi_k8s_pods="${mi_node_pods:-0}"
+            mi_k8s_pods="${_ME_PODS[$mi_k8s_node]:-0}"
         fi
         
         local mi_sort_ann="$mi_ann"
@@ -9307,353 +9554,182 @@ list_maintenance_events() {
         echo -e "${YELLOW}Found ${WHITE}${maint_inst_count}${YELLOW} instance(s) requiring attention${NC}"
     fi
     
-    # Announcement details section
-    echo ""
-    _ui_subheader "Announcement Details" 0
-    echo ""
-    printf "${BOLD}%-4s %-10s %-15s %-20s %-20s %-115s${NC}\n" \
-        "ID" "Ticket" "Type" "Start" "End" "Description"
-    print_separator 190
-    
-    local me_ann_idx=0
+    # Instance maintenance details section (announcements linked to events — only when enabled)
     declare -A ANN_TICKET_MAP=()
-    local me_shown_announcements=""
-    local me_sorted_tickets
-    me_sorted_tickets=$(awk -F'|' '{print $3}' "$maint_output_temp" 2>/dev/null | tr ',' '\n' | grep -v '^-$' | grep -v '^$' | sort -u)
-    
-    # Collect sort keys — only 3 safe fields: sort_key|ticket|detail_file
-    # Description may contain pipe chars, so never include it in the sort file
-    local me_ann_sort_temp
-    me_ann_sort_temp=$(create_temp_file) || true
-    
-    local me_ticket
-    while read -r me_ticket; do
-        [[ -z "$me_ticket" ]] && continue
-        [[ "$me_shown_announcements" == *"|${me_ticket}|"* ]] && continue
-        me_shown_announcements="${me_shown_announcements}|${me_ticket}|"
-        
-        local me_ann_detail_file=""
-        local me_cache_scan
-        for me_cache_scan in "$CACHE_DIR"/ann_*.json; do
-            [[ ! -f "$me_cache_scan" ]] && continue
-            local me_ref_ticket
-            me_ref_ticket=$(jq -r '.data."reference-ticket-number" // ""' "$me_cache_scan" 2>/dev/null)
-            if [[ "${me_ref_ticket:0:8}" == "$me_ticket" ]]; then
-                me_ann_detail_file="$me_cache_scan"
-                break
-            fi
+    declare -A _ME_ANN_DATA=()
+
+    if [[ "$me_link_announcements" == "true" ]]; then
+        echo ""
+        _ui_subheader "Linked Announcements" 0
+        echo ""
+        printf "${BOLD}%-4s %-10s %-15s %-20s %-20s %-115s${NC}\n" \
+            "ID" "Ticket" "Type" "Start" "End" "Description"
+        print_separator 190
+
+        local me_ann_idx=0
+        local me_sorted_tickets
+        me_sorted_tickets=$(awk -F'|' '{print $3}' "$maint_output_temp" 2>/dev/null | tr ',' '\n' | grep -v '^-$' | grep -v '^$' | sort -u)
+
+        # Pre-build announcement data map: one jq call per ann_*.json file (replaces N×M scans)
+        # Key: short ticket (first 8 chars) → "type\tstart\tend\tdesc\tdetail_file"
+        # Uses tab delimiter since descriptions may contain pipes
+        local _ma_file
+        for _ma_file in "$CACHE_DIR"/ann_*.json; do
+            [[ ! -f "$_ma_file" ]] && continue
+            local _ma_raw
+            _ma_raw=$(jq -r '.data | [
+                (.["reference-ticket-number"] // ""),
+                (.["announcement-type"] // "N/A"),
+                (.["time-one-value"] // "N/A"),
+                (.["time-two-value"] // "N/A"),
+                ((.description // "N/A") | gsub("[\\t\\n]"; " "))
+            ] | @tsv' "$_ma_file" 2>/dev/null) || continue
+            [[ -z "$_ma_raw" ]] && continue
+            local _ma_ticket _ma_type _ma_start _ma_end _ma_desc
+            IFS=$'\t' read -r _ma_ticket _ma_type _ma_start _ma_end _ma_desc <<< "$_ma_raw"
+            [[ -z "$_ma_ticket" ]] && continue
+            local _ma_short="${_ma_ticket:0:8}"
+            _ME_ANN_DATA[$_ma_short]="${_ma_type}	${_ma_start}	${_ma_end}	${_ma_desc}	${_ma_file}"
         done
-        
-        if [[ -n "$me_ann_detail_file" && -f "$me_ann_detail_file" ]]; then
-            local me_ann_start
-            me_ann_start=$(jq -r '.data["time-one-value"] // "N/A"' "$me_ann_detail_file" 2>/dev/null)
-            local me_sort_key="$me_ann_start"
-            [[ "$me_ann_start" == "N/A" || "$me_ann_start" == "null" || -z "$me_ann_start" ]] && me_sort_key="zzz"
-            echo "${me_sort_key}|${me_ticket}|${me_ann_detail_file}" >> "$me_ann_sort_temp"
-        else
-            echo "zzz|${me_ticket}|" >> "$me_ann_sort_temp"
+
+        # Collect sort keys — ticket + start time for sorting
+        local me_ann_sort_temp
+        me_ann_sort_temp=$(create_temp_file) || true
+
+        local me_shown_announcements=""
+        local me_ticket
+        while read -r me_ticket; do
+            [[ -z "$me_ticket" ]] && continue
+            [[ "$me_shown_announcements" == *"|${me_ticket}|"* ]] && continue
+            me_shown_announcements="${me_shown_announcements}|${me_ticket}|"
+
+            local me_ann_info="${_ME_ANN_DATA[$me_ticket]:-}"
+            if [[ -n "$me_ann_info" ]]; then
+                local _sa_start
+                _sa_start=$(echo "$me_ann_info" | cut -f2)
+                local me_sort_key="$_sa_start"
+                [[ "$_sa_start" == "N/A" || "$_sa_start" == "null" || -z "$_sa_start" ]] && me_sort_key="zzz"
+                echo "${me_sort_key}|${me_ticket}" >> "$me_ann_sort_temp"
+            else
+                echo "zzz|${me_ticket}" >> "$me_ann_sort_temp"
+            fi
+        done <<< "$me_sorted_tickets"
+
+        # Sort by start time and display — all data from pre-built map (no jq calls)
+        while IFS='|' read -r _sort_key me_ticket; do
+            [[ -z "$me_ticket" ]] && continue
+            ((me_ann_idx++))
+
+            local me_ann_info="${_ME_ANN_DATA[$me_ticket]:-}"
+            if [[ -n "$me_ann_info" ]]; then
+                local me_ann_type me_ann_start me_ann_end me_ann_desc me_ann_detail_file
+                IFS=$'\t' read -r me_ann_type me_ann_start me_ann_end me_ann_desc me_ann_detail_file <<< "$me_ann_info"
+
+                local me_start_disp="${me_ann_start:0:16}" me_end_disp="${me_ann_end:0:16}"
+                [[ "$me_ann_start" == "N/A" || "$me_ann_start" == "null" ]] && me_start_disp="-"
+                [[ "$me_ann_end" == "N/A" || "$me_ann_end" == "null" ]] && me_end_disp="-"
+                local me_desc_trunc="${me_ann_desc:0:115}"
+                [[ ${#me_ann_desc} -gt 115 ]] && me_desc_trunc="${me_desc_trunc}..."
+                ANN_TICKET_MAP["a${me_ann_idx}"]="${me_ticket}|${me_ann_detail_file}"
+                local me_type_color="$WHITE"
+                case "$me_ann_type" in
+                    ACTION_REQUIRED) me_type_color="$RED" ;;
+                    EMERGENCY_MAINTENANCE) me_type_color="$RED" ;;
+                    SCHEDULED_MAINTENANCE) me_type_color="$YELLOW" ;;
+                    ACTION_RECOMMENDED) me_type_color="$YELLOW" ;;
+                    *) me_type_color="$CYAN" ;;
+                esac
+                printf "${YELLOW}%-4s${NC} %-10s ${me_type_color}%-15s${NC} %-20s %-20s ${GRAY}%-115s${NC}\n" \
+                    "a${me_ann_idx}" "$me_ticket" "${me_ann_type:0:15}" "$me_start_disp" "$me_end_disp" "$me_desc_trunc"
+            else
+                ANN_TICKET_MAP["a${me_ann_idx}"]="${me_ticket}|"
+                printf "${YELLOW}%-4s${NC} %-10s %-15s %-20s %-20s ${GRAY}%-115s${NC}\n" \
+                    "a${me_ann_idx}" "$me_ticket" "(not cached)" "-" "-" "Run --refresh to fetch details"
+            fi
+        done < <(sort -t'|' -k1,1 "$me_ann_sort_temp" 2>/dev/null)
+        rm -f "$me_ann_sort_temp"
+
+        if [[ $me_ann_idx -eq 0 ]]; then
+            echo -e "${GRAY}  No active announcements${NC}"
+            $DEBUG_MODE && echo -e "${GRAY}[DEBUG] ann_details: sorted_tickets='$(echo "$me_sorted_tickets" | head -3)' _ME_ANN_DATA_size=${#_ME_ANN_DATA[@]} maint_output_lines=$(wc -l < "$maint_output_temp" 2>/dev/null || echo 0) INST_ANN_size=${#INSTANCE_ANNOUNCEMENTS[@]}${NC}" >&2
         fi
-    done <<< "$me_sorted_tickets"
-    
-    # Sort by start time (field 1) and display — re-read JSON for safe field extraction
-    while IFS='|' read -r _sort_key me_ticket me_ann_detail_file; do
-        [[ -z "$me_ticket" ]] && continue
-        ((me_ann_idx++))
-        
-        if [[ -n "$me_ann_detail_file" && -f "$me_ann_detail_file" ]]; then
-            local me_ann_type me_ann_start me_ann_end me_ann_desc
-            me_ann_type=$(jq -r '.data["announcement-type"] // "N/A"' "$me_ann_detail_file" 2>/dev/null)
-            me_ann_start=$(jq -r '.data["time-one-value"] // "N/A"' "$me_ann_detail_file" 2>/dev/null)
-            me_ann_end=$(jq -r '.data["time-two-value"] // "N/A"' "$me_ann_detail_file" 2>/dev/null)
-            me_ann_desc=$(jq -r '.data.description // "N/A"' "$me_ann_detail_file" 2>/dev/null)
-            
-            local me_start_disp="${me_ann_start:0:16}" me_end_disp="${me_ann_end:0:16}"
-            [[ "$me_ann_start" == "N/A" || "$me_ann_start" == "null" ]] && me_start_disp="-"
-            [[ "$me_ann_end" == "N/A" || "$me_ann_end" == "null" ]] && me_end_disp="-"
-            local me_desc_trunc="${me_ann_desc:0:115}"
-            [[ ${#me_ann_desc} -gt 115 ]] && me_desc_trunc="${me_desc_trunc}..."
-            ANN_TICKET_MAP["a${me_ann_idx}"]="${me_ticket}|${me_ann_detail_file}"
-            local me_type_color="$WHITE"
-            case "$me_ann_type" in
-                ACTION_REQUIRED) me_type_color="$RED" ;;
-                EMERGENCY_MAINTENANCE) me_type_color="$RED" ;;
-                SCHEDULED_MAINTENANCE) me_type_color="$YELLOW" ;;
-                ACTION_RECOMMENDED) me_type_color="$YELLOW" ;;
-                *) me_type_color="$CYAN" ;;
-            esac
-            printf "${YELLOW}%-4s${NC} %-10s ${me_type_color}%-15s${NC} %-20s %-20s ${GRAY}%-115s${NC}\n" \
-                "a${me_ann_idx}" "$me_ticket" "${me_ann_type:0:15}" "$me_start_disp" "$me_end_disp" "$me_desc_trunc"
-        else
-            ANN_TICKET_MAP["a${me_ann_idx}"]="${me_ticket}|"
-            printf "${YELLOW}%-4s${NC} %-10s %-15s %-20s %-20s ${GRAY}%-115s${NC}\n" \
-                "a${me_ann_idx}" "$me_ticket" "(not cached)" "-" "-" "Run --refresh to fetch details"
-        fi
-    done < <(sort -t'|' -k1,1 "$me_ann_sort_temp" 2>/dev/null)
-    rm -f "$me_ann_sort_temp"
-    
-    if [[ $me_ann_idx -eq 0 ]]; then
-        echo -e "${GRAY}  No active announcements${NC}"
+
+        echo ""
     fi
-    
-    echo ""
     rm -f "$maint_output_temp"
     
     #==========================================================================
     # Display events table
     #==========================================================================
     echo ""
-    
-    # Pre-build fault detail lookup: event_id → faultId~component~severity~description~impact~recommended
-    # Uses persistent cache file to avoid re-fetching on every display
-    declare -A ME_FAULT_MAP=()
-    
-    # Load from persistent cache first
-    if [[ -f "$FAULT_DETAILS_CACHE" && -s "$FAULT_DETAILS_CACHE" ]]; then
-        while IFS='=' read -r fc_evt_id fc_data; do
-            [[ -z "$fc_evt_id" || "$fc_evt_id" == "#"* ]] && continue
-            [[ -n "$fc_data" && "$fc_data" != "-~-~-~-~-~-" ]] && ME_FAULT_MAP[$fc_evt_id]="$fc_data"
-        done < "$FAULT_DETAILS_CACHE"
-    fi
-    
-    # Extract from list response additional-details (flat keys or nested faultDetails)
-    while IFS='~' read -r flt_evt_id flt_fault_id flt_component flt_severity flt_desc flt_impact flt_recommended; do
-        [[ -z "$flt_evt_id" ]] && continue
-        [[ "$flt_fault_id" == "-" && "$flt_component" == "-" && "$flt_severity" == "-" ]] && continue
-        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue  # already in cache
-        ME_FAULT_MAP[$flt_evt_id]="${flt_fault_id}~${flt_component}~${flt_severity}~${flt_desc}~${flt_impact}~${flt_recommended}"
-    done < <(jq -r '
-        .data[] |
-        .id as $eid |
-        (.["additional-details"] // {}) as $ad |
-        (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
-         if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
-         if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
-        ) as $nested |
-        if $nested != null then
-            "\($eid)~\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
-        elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
-            "\($eid)~\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
-        else
-            empty
-        end
-    ' "$cache_file" 2>/dev/null)
-    
-    # Parallel fetch for events not yet in cache
-    local fault_temp_dir="${TEMP_DIR}/fault_detail_$$"
-    mkdir -p "$fault_temp_dir" 2>/dev/null
-    local fault_fetch_count=0
-    local fault_fetch_pids=()
-    local fault_total_to_fetch=0
-    
-    # Build filtered event ID list based on current filter_type
-    # This avoids fetching fault details for events that won't be displayed
-    local filtered_evt_ids_file
-    filtered_evt_ids_file=$(create_temp_file) || true
-    
-    while IFS='|' read -r _filt_id _filt_inst_id _filt_lifecycle _filt_time_finished; do
-        [[ -z "$_filt_id" ]] && continue
-        
-        # Apply same filters as the events display table
-        if [[ "$filter_type" == "named" ]]; then
-            # Skip events with unnamed instances
-            local _filt_inst_name=""
-            _filt_inst_name=$(grep -F "$_filt_inst_id" "$me_inst_temp" 2>/dev/null | head -1 | cut -d'|' -f2)
-            [[ -z "$_filt_inst_name" || "$_filt_inst_name" == "N/A" ]] && continue
-            # Only show events where compute host health is not HEALTHY
-            local _filt_cap_topo
-            _filt_cap_topo=$(get_compute_host_health "$_filt_inst_id" 2>/dev/null)
-            [[ "$_filt_cap_topo" == "HEALTHY" || "$_filt_cap_topo" == "N/A" ]] && continue
-        elif [[ "$filter_type" == "PROCESSING" || "$filter_type" == "SUCCEEDED" || "$filter_type" == "CANCELED" || "$filter_type" == "SCHEDULED" ]]; then
-            [[ "${_filt_lifecycle^^}" != "${filter_type}" ]] && continue
-        fi
-        # filter_type "none" passes everything through
-        
-        echo "$_filt_id" >> "$filtered_evt_ids_file"
-    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["lifecycle-state"] // "")|\(.["time-finished"] // "null")"' "$cache_file" 2>/dev/null)
-    
-    local filtered_evt_count
-    filtered_evt_count=$(wc -l < "$filtered_evt_ids_file" 2>/dev/null | tr -d ' ')
-    [[ -z "$filtered_evt_count" ]] && filtered_evt_count=0
-    
-    # Count how many need fetching (only filtered events)
-    while IFS= read -r flt_evt_id; do
-        [[ -z "$flt_evt_id" ]] && continue
-        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
-        ((fault_total_to_fetch++))
-    done < "$filtered_evt_ids_file"
-    
-    if [[ $fault_total_to_fetch -gt 0 ]]; then
-        _progress_start "$fault_temp_dir" "done_*" "$fault_total_to_fetch" "Fetching fault details"
-    fi
-    
-    while IFS= read -r flt_evt_id; do
-        [[ -z "$flt_evt_id" ]] && continue
-        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
-        
-        # Fetch individual event in background
-        (
-            local evt_detail
-            evt_detail=$(oci compute instance-maintenance-event get \
-                --instance-maintenance-event-id "$flt_evt_id" \
-                --region "$region" \
-                --output json 2>/dev/null)
-            if [[ -n "$evt_detail" ]]; then
-                local fault_line
-                fault_line=$(jq -r '
-                    (.data["additional-details"] // {}) as $ad |
-                    (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
-                     if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
-                     if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
-                    ) as $nested |
-                    if $nested != null then
-                        "\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
-                    elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
-                        "\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
-                    else
-                        "-~-~-~-~-~-"
-                    end
-                ' <<< "$evt_detail" 2>/dev/null)
-                if [[ -n "$fault_line" && "$fault_line" != "-~-~-~-~-~-" ]]; then
-                    echo "$fault_line" > "$fault_temp_dir/$flt_evt_id"
-                fi
-            fi
-            # Always write completion marker for progress tracking
-            touch "$fault_temp_dir/done_${flt_evt_id}"
-        ) >/dev/null 2>&1 &
-        fault_fetch_pids+=($!)
-        ((fault_fetch_count++))
-        
-        # Throttle: wait after every 10 parallel fetches
-        if [[ $fault_fetch_count -ge 10 ]]; then
-            wait "${fault_fetch_pids[@]}" 2>/dev/null
-            fault_fetch_pids=()
-            fault_fetch_count=0
-        fi
-    done < "$filtered_evt_ids_file"
-    
-    # Wait for remaining background jobs
-    if [[ ${#fault_fetch_pids[@]} -gt 0 ]]; then
-        wait "${fault_fetch_pids[@]}" 2>/dev/null
-    fi
-    
-    # Stop progress bar
-    _progress_done "$fault_total_to_fetch" "Fetching fault details"
-    
-    # Read fetched fault details into ME_FAULT_MAP
-    local fault_found_count=0
-    local cache_updated=false
-    for fault_file in "$fault_temp_dir"/*; do
-        [[ ! -f "$fault_file" ]] && continue
-        local f_evt_id
-        f_evt_id=$(basename "$fault_file")
-        # Skip completion marker files (used by progress bar only)
-        [[ "$f_evt_id" == done_* ]] && continue
-        local f_data
-        f_data=$(cat "$fault_file" 2>/dev/null)
-        if [[ -n "$f_data" && "$f_data" != "-~-~-~-~-~-" ]]; then
-            ME_FAULT_MAP[$f_evt_id]="$f_data"
-            ((fault_found_count++))
-            cache_updated=true
-        fi
-    done
-    rm -rf "${fault_temp_dir:?}" 2>/dev/null
-    rm -f "$filtered_evt_ids_file" 2>/dev/null
-    
-    if [[ $fault_total_to_fetch -gt 0 && $fault_found_count -gt 0 ]]; then
-        echo -e "  ${GRAY}(${fault_found_count} events with fault data)${NC}"
-    fi
-    
-    # Persist fault cache to disk (write full map)
-    if [[ "$cache_updated" == "true" || ! -f "$FAULT_DETAILS_CACHE" ]]; then
-        {
-            echo "# Fault details cache - event_id=faultId~component~severity~description~impact~recommended"
-            for fc_key in "${!ME_FAULT_MAP[@]}"; do
-                echo "${fc_key}=${ME_FAULT_MAP[$fc_key]}"
-            done
-        } | _cache_write "$FAULT_DETAILS_CACHE"
-    fi
-    
+
     # Compute epoch thresholds for 5-minute imminent window highlighting
     local me_now_epoch
     me_now_epoch=$(date -u +%s)
     local me_5min_epoch=$(( me_now_epoch + 300 ))
     
+    _ui_subheader "Instance Maintenance Details" 0
+    echo ""
+
     # Show current UTC time with datetime aligned to Window Start column
     printf "  %-4s %-30s %-20s %-14s %-10s %-8s %-6s %-8s %-5s %-22s %-12s %-11s ${GRAY}%28s ${WHITE}%-26s${NC}\n" \
         "" "" "" "" "" "" "" "" "" "" "" "" "Current UTC:" "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"
-    
+
     _col_build_fmt "ME"
     printf "  ${BOLD}${_ME_HDR_FMT}${NC}\n" "${_ME_HDR_ARGS[@]}"
     print_separator $((_ME_SEP_WIDTH + 2))
     
     declare -A ME_EVENT_MAP=()
     declare -A ME_INSTANCE_MAP=()
+    declare -A _me_fault_counts=()
+    declare -A _me_fault_lc_counts=()
+    declare -A _me_cluster_counts=()
+    declare -A _me_cluster_fault_counts=()
+    declare -A _me_cluster_lc_counts=()
     local me_idx=0
-    
+
     while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_time_finished evt_additional; do
         [[ -z "$evt_id" ]] && continue
         
-        # Look up instance details
-        local inst_name="N/A" inst_shape="N/A" inst_state="N/A" inst_ad="N/A" inst_gpu_mem="N/A"
-        local inst_info
-        inst_info=$(grep -F "$evt_instance_id" "$me_inst_temp" 2>/dev/null | head -1)
-        if [[ -n "$inst_info" ]]; then
-            inst_name=$(echo "$inst_info" | cut -d'|' -f2)
-            inst_shape=$(echo "$inst_info" | cut -d'|' -f3)
-            inst_state=$(echo "$inst_info" | cut -d'|' -f4)
-            inst_ad=$(echo "$inst_info" | cut -d'|' -f5)
-            inst_gpu_mem=$(echo "$inst_info" | cut -d'|' -f6)
-        fi
-        
-        # Apply filters
-        # Named filter: skip events without a matching instance name
-        if [[ "$filter_type" == "named" && ("$inst_name" == "N/A" || -z "$inst_name") ]]; then
+        # Skip events not in filtered set (filter already applied in filter pass)
+        if [[ "$filter_type" != "none" && -z "${_ME_FILTERED_EVTS[$evt_id]:-}" ]]; then
             continue
         fi
-        # Lifecycle state filters: skip events not matching the filter
-        if [[ "$filter_type" == "PROCESSING" || "$filter_type" == "SUCCEEDED" || "$filter_type" == "CANCELED" || "$filter_type" == "SCHEDULED" ]]; then
-            if [[ "${evt_lifecycle^^}" != "${filter_type}" ]]; then
-                continue
-            fi
-        fi
-        
-        # Look up compute host health for this instance
-        local evt_cap_topo="N/A"
-        evt_cap_topo=$(get_compute_host_health "$evt_instance_id" 2>/dev/null)
-        [[ -z "$evt_cap_topo" ]] && evt_cap_topo="N/A"
 
-        # When named filter is active: only show events where host health is not HEALTHY
-        if [[ "$filter_type" == "named" && ( "$evt_cap_topo" == "HEALTHY" || "$evt_cap_topo" == "N/A" ) ]]; then
-            continue
+        # Look up instance details from pre-built map
+        local inst_name="N/A" inst_shape="N/A" inst_state="N/A" inst_ad="N/A" inst_gpu_mem="N/A"
+        local inst_info="${_ME_INST[$evt_instance_id]:-}"
+        if [[ -n "$inst_info" ]]; then
+            IFS='|' read -r inst_name inst_shape inst_state inst_ad inst_gpu_mem <<< "$inst_info"
         fi
-        
+
+        # Resolve GPU memory cluster display name from instance→cluster map
+        local inst_gpu_cluster_name="${_ME_GPU_CLUSTER[$evt_instance_id]:-N/A}"
+
+        # Look up compute host health from pre-built map
+        local evt_cap_topo="${_ME_HOST_HEALTH[$evt_instance_id]:-N/A}"
+
         ((me_idx++))
-        
-        # Look up K8s node (expanded: name|ready|unschedulable|taint_count|taint_names|serial)
+
+        # Look up K8s node from pre-built map
         local k8s_node="N/A" k8s_ready="N/A" k8s_unsched="false" k8s_taint_count="0" k8s_taint_names="" k8s_serial="N/A"
-        local k8s_match
-        k8s_match=$(echo "$me_k8s_lookup" | grep -F "$evt_instance_id" 2>/dev/null)
+        local k8s_match="${_ME_K8S[$evt_instance_id]:-}"
         if [[ -n "$k8s_match" ]]; then
-            k8s_node=$(echo "$k8s_match" | cut -d'|' -f2)
-            k8s_ready=$(echo "$k8s_match" | cut -d'|' -f3)
-            k8s_unsched=$(echo "$k8s_match" | cut -d'|' -f4)
-            k8s_taint_count=$(echo "$k8s_match" | cut -d'|' -f5)
-            k8s_taint_names=$(echo "$k8s_match" | cut -d'|' -f6)
-            k8s_serial=$(echo "$k8s_match" | cut -d'|' -f7)
+            IFS='|' read -r k8s_node k8s_ready k8s_unsched k8s_taint_count k8s_taint_names k8s_serial <<< "$k8s_match"
         fi
-        
-        # Get pod count for this node
+
+        # Get pod count from pre-built map
         local k8s_pods="-"
         if [[ "$k8s_node" != "N/A" && -n "$k8s_node" ]]; then
-            local node_pod_count
-            node_pod_count=$(echo "$me_pods_per_node" | grep "^${k8s_node}|" | cut -d'|' -f2)
-            k8s_pods="${node_pod_count:-0}"
+            k8s_pods="${_ME_PODS[$k8s_node]:-0}"
         fi
-        
-        # Get announcements for this instance
+
+        # Get announcements for this instance (only when linked)
         local inst_announcement="-"
-        inst_announcement=$(get_resource_announcements "$evt_instance_id" "$inst_gpu_mem" 2>/dev/null)
-        [[ -z "$inst_announcement" ]] && inst_announcement="-"
+        if [[ "$me_link_announcements" == "true" ]]; then
+            inst_announcement=$(get_resource_announcements "$evt_instance_id" "$inst_gpu_mem" 2>/dev/null)
+            [[ -z "$inst_announcement" ]] && inst_announcement="-"
+        fi
         
         # Store mappings (include instance-action)
         ME_EVENT_MAP[$me_idx]="${evt_id}|${evt_instance_id}|${evt_reason}|${evt_category}|${evt_lifecycle}|${evt_window_start}|${evt_hard_due}|${evt_can_resched}|${evt_display_name}|${inst_name}|${k8s_node}|${inst_shape}|${inst_state}|${evt_instance_action}|${evt_time_finished}|${evt_additional}"
@@ -9838,7 +9914,23 @@ list_maintenance_events() {
             IFS='~' read -r rf_fault_id rf_component rf_severity rf_desc rf_impact rf_recommended <<< "$row_fault"
             [[ "$rf_fault_id" != "-" && -n "$rf_fault_id" ]] && compact_fault_code="$rf_fault_id"
         fi
-        
+
+        # Accumulate summary counters
+        local _lc="${evt_lifecycle:-N/A}"
+        if [[ "$compact_fault_code" != "-" ]]; then
+            ((_me_fault_counts[$compact_fault_code]=${_me_fault_counts[$compact_fault_code]:-0}+1))
+            ((_me_fault_lc_counts["${compact_fault_code}|${_lc}"]=${_me_fault_lc_counts["${compact_fault_code}|${_lc}"]:-0}+1))
+        fi
+        if [[ "$inst_gpu_cluster_name" != "N/A" && -n "$inst_gpu_cluster_name" ]]; then
+            ((_me_cluster_counts[$inst_gpu_cluster_name]=${_me_cluster_counts[$inst_gpu_cluster_name]:-0}+1))
+            ((_me_cluster_lc_counts["${inst_gpu_cluster_name}|${_lc}"]=${_me_cluster_lc_counts["${inst_gpu_cluster_name}|${_lc}"]:-0}+1))
+            # Compound key: "cluster|fault_code" for sub-line breakdown
+            local _cf_fault="${compact_fault_code}"
+            [[ "$_cf_fault" == "-" ]] && _cf_fault="(no fault code)"
+            local _cf_compound="${inst_gpu_cluster_name}|${_cf_fault}"
+            ((_me_cluster_fault_counts[$_cf_compound]=${_me_cluster_fault_counts[$_cf_compound]:-0}+1))
+        fi
+
         if [[ "$me_view_mode" == "detail" ]]; then
             # Compute host health color
             local cap_topo_color
@@ -9846,7 +9938,7 @@ list_maintenance_events() {
             
             # ── Detail view: full row + fault sub-line + blank line ──
             printf "  "
-            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "-" "$evt_cap_topo" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$GRAY" "$cap_topo_color"
+            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "-" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$GRAY" "$cap_topo_color" "$GRAY" "$GRAY" "$CYAN"
             
             # Display fault/additional details as dim sub-line aligned to main row columns
             # ↳ indented 3 spaces, then:  Fault ID→Instance Name  Component→K8s Node  Sev→Serial
@@ -9911,16 +10003,69 @@ list_maintenance_events() {
             cap_topo_color=$(color_host_health "$evt_cap_topo")
             
             printf "  "
-            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$fault_code_color" "$cap_topo_color"
+            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$fault_code_color" "$cap_topo_color" "$GRAY" "$GRAY" "$CYAN"
         fi
             
     done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
     
     echo ""
     echo -e "${GRAY}Total: ${WHITE}${me_idx}${GRAY} maintenance event(s)${NC}"
-    
-    # Show taint legend if any taints found
-    local any_taints=false
+
+    # Summary by fault code with lifecycle breakdown
+    if [[ ${#_me_fault_counts[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${GRAY}By Fault Code:${NC}"
+        local _fc_key
+        while IFS= read -r _fc_key; do
+            [[ -z "$_fc_key" ]] && continue
+            printf "  ${CYAN}%-28s${NC} ${WHITE}%4d${NC} ${GRAY}node(s)${NC}" "$_fc_key" "${_me_fault_counts[$_fc_key]}"
+            # Inline lifecycle counts
+            local _fl_parts=""
+            local _fl_key
+            while IFS= read -r _fl_key; do
+                [[ -z "$_fl_key" ]] && continue
+                local _fl_fc="${_fl_key%%|*}" _fl_lc="${_fl_key#*|}"
+                [[ "$_fl_fc" != "$_fc_key" ]] && continue
+                _fl_parts="${_fl_parts} ${_fl_lc}:${_me_fault_lc_counts[$_fl_key]}"
+            done < <(printf '%s\n' "${!_me_fault_lc_counts[@]}" | sort)
+            [[ -n "$_fl_parts" ]] && printf "  ${GRAY}(%s )${NC}" "$_fl_parts"
+            printf "\n"
+        done < <(printf '%s\n' "${!_me_fault_counts[@]}" | sort)
+    fi
+
+    # Summary by GPU memory cluster with fault code + lifecycle breakdown
+    if [[ ${#_me_cluster_counts[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${GRAY}By GPU Cluster:${NC}"
+        local _gc_key
+        while IFS= read -r _gc_key; do
+            [[ -z "$_gc_key" ]] && continue
+            printf "  ${CYAN}%-28s${NC} ${WHITE}%4d${NC} ${GRAY}node(s)${NC}" "$_gc_key" "${_me_cluster_counts[$_gc_key]}"
+            # Inline lifecycle counts for this cluster
+            local _cl_parts=""
+            local _cl_key
+            while IFS= read -r _cl_key; do
+                [[ -z "$_cl_key" ]] && continue
+                local _cl_gc="${_cl_key%%|*}" _cl_lc="${_cl_key#*|}"
+                [[ "$_cl_gc" != "$_gc_key" ]] && continue
+                _cl_parts="${_cl_parts} ${_cl_lc}:${_me_cluster_lc_counts[$_cl_key]}"
+            done < <(printf '%s\n' "${!_me_cluster_lc_counts[@]}" | sort)
+            [[ -n "$_cl_parts" ]] && printf "  ${GRAY}(%s )${NC}" "$_cl_parts"
+            printf "\n"
+            # Sub-lines: fault codes within this cluster
+            local _cf_key
+            while IFS= read -r _cf_key; do
+                [[ -z "$_cf_key" ]] && continue
+                local _cf_cluster="${_cf_key%%|*}"
+                local _cf_fault="${_cf_key#*|}"
+                [[ "$_cf_cluster" != "$_gc_key" ]] && continue
+                printf "    ${GRAY}↳${NC} ${YELLOW}%-24s${NC} ${WHITE}%4d${NC}\n" "$_cf_fault" "${_me_cluster_fault_counts[$_cf_key]}"
+            done < <(printf '%s\n' "${!_me_cluster_fault_counts[@]}" | sort)
+        done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
+    fi
+
+    # Count tainted nodes for hint in menu
+    local _me_tainted_count=0
     for ((ti=1; ti<=me_idx; ti++)); do
         local ti_info="${ME_EVENT_MAP[$ti]:-}"
         [[ -z "$ti_info" ]] && continue
@@ -9931,34 +10076,9 @@ list_maintenance_events() {
             ti_k8s_match=$(echo "$me_k8s_lookup" | grep "$ti_k8s_node" 2>/dev/null | head -1)
             local ti_taint_names
             ti_taint_names=$(echo "$ti_k8s_match" | rev | cut -d'|' -f1 | rev)
-            if [[ -n "$ti_taint_names" && "$ti_taint_names" != "0" ]]; then
-                any_taints=true
-                break
-            fi
+            [[ -n "$ti_taint_names" && "$ti_taint_names" != "0" ]] && ((_me_tainted_count++))
         fi
     done
-    
-    if [[ "$any_taints" == "true" ]]; then
-        echo ""
-        _ui_subheader "Taint Details" 0
-        for ((ti=1; ti<=me_idx; ti++)); do
-            local ti_info="${ME_EVENT_MAP[$ti]:-}"
-            [[ -z "$ti_info" ]] && continue
-            local ti_inst_name ti_k8s_node
-            ti_inst_name=$(echo "$ti_info" | cut -d'|' -f10)
-            ti_k8s_node=$(echo "$ti_info" | cut -d'|' -f11)
-            if [[ "$ti_k8s_node" != "N/A" && -n "$ti_k8s_node" ]]; then
-                local ti_k8s_match
-                ti_k8s_match=$(echo "$me_k8s_lookup" | grep "$ti_k8s_node" 2>/dev/null | head -1)
-                local ti_taint_count ti_taint_names
-                ti_taint_count=$(echo "$ti_k8s_match" | cut -d'|' -f5)
-                ti_taint_names=$(echo "$ti_k8s_match" | cut -d'|' -f6)
-                if [[ -n "$ti_taint_names" && "$ti_taint_count" -gt 0 ]] 2>/dev/null; then
-                    echo -e "  ${YELLOW}#$ti${NC} ${WHITE}${ti_inst_name:0:30}${NC}: ${GRAY}${ti_taint_names}${NC}"
-                fi
-            fi
-        done
-    fi
     echo ""
     
     #==========================================================================
@@ -9975,8 +10095,12 @@ list_maintenance_events() {
         echo -e "    ${CYAN}p #${NC}                    - View pods on event node (e.g., 'p 1' or 'p 1,3,5' or 'p all')"
         _ui_action_group "Maintenance Instances"
         echo -e "    ${YELLOW}m#${NC}                     - View full instance details (e.g., 'm1' for instance detail view)"
-        echo -e "    ${YELLOW}a#${NC}                     - View announcement details (e.g., 'a1')"
-        echo -e "    ${CYAN}pods m1,m2${NC}             - View pods on nodes (or 'pods all')"
+        echo -e "    ${YELLOW}h#${NC}                     - View compute host details (e.g., 'h1' for host detail view)"
+        if [[ "$me_link_announcements" == "true" ]]; then
+            echo -e "    ${YELLOW}a#${NC}                     - View announcement details (e.g., 'a1')"
+        fi
+        echo -e "    ${CYAN}p m1,m2${NC}                - View pods on nodes (or 'p all')"
+        [[ $_me_tainted_count -gt 0 ]] && echo -e "    ${CYAN}taints${NC}                 - Show taint details (${_me_tainted_count} tainted nodes)"
         echo -e "    ${ORANGE}c m1,m2${NC}                - Cordon multiple nodes (or 'd m1,m2' / 'cd m1,m2' / 'uncordon m1,m2' / 'terminate m1,m2')"
         _ui_action_group "General"
         if [[ "$me_view_mode" == "compact" ]]; then
@@ -9985,7 +10109,10 @@ list_maintenance_events() {
             echo -e "    ${CYAN}view${NC}                   - Switch to compact view (single-line)"
         fi
         echo -e "    ${CYAN}filter${NC}                 - Filter events (${GREEN}n${NC}=named ${GREEN}p${NC}=processing ${GREEN}su${NC}=succeeded ${GREEN}c${NC}=canceled ${GREEN}sc${NC}=scheduled ${GREEN}all${NC}=clear)"
-        echo -e "    ${CYAN}list${NC}                   - Show announcement details again"
+        if [[ "$me_link_announcements" == "true" ]]; then
+            echo -e "    ${CYAN}list${NC}                   - Show announcement details again"
+        fi
+        echo -e "    ${CYAN}ann${NC}                    - Toggle announcement linking (currently: $(  [[ "$me_link_announcements" == "true" ]] && echo -e "${GREEN}ON${NC}" || echo -e "${GRAY}OFF${NC}"))"
         echo -e "    ${CYAN}col${NC}                    - Toggle column visibility"
         echo -e "    ${MAGENTA}r${NC}                      - Force refresh from OCI (invalidate cache)"
         echo -e "    ${CYAN}q${NC}                      - Back"
@@ -9999,7 +10126,7 @@ list_maintenance_events() {
         # Show: re-display the full maintenance events page
         if [[ "$me_selection" == "show" || "$me_selection" == "SHOW" ]]; then
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$me_view_mode" "$me_link_announcements"
             return
         fi
         
@@ -10011,7 +10138,7 @@ list_maintenance_events() {
             me_selection="cordon ${BASH_REMATCH[1]}"
         elif [[ "$me_selection" =~ ^d[[:space:]]+(.+)$ ]]; then
             me_selection="drain ${BASH_REMATCH[1]}"
-        elif [[ "$me_selection" =~ ^p[[:space:]]+(.+)$ && ! "$me_selection" =~ ^pods ]]; then
+        elif [[ "$me_selection" =~ ^p[[:space:]]+(.+)$ && "$me_selection" != pods* ]]; then
             me_selection="pods ${BASH_REMATCH[1]}"
         fi
         
@@ -10020,15 +10147,15 @@ list_maintenance_events() {
             local new_view="compact"
             [[ "$me_view_mode" == "compact" ]] && new_view="detail"
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$new_view"
+            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$new_view" "$me_link_announcements"
             return
         fi
-        
+
         # Column visibility toggle
         if [[ "${me_selection,,}" == "col" ]]; then
             _col_picker "ME" "Maintenance Event Columns"
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$me_view_mode" "$me_link_announcements"
             return
         fi
 
@@ -10037,7 +10164,7 @@ list_maintenance_events() {
             rm -f "$MAINT_EVENTS_CACHE" "$FAULT_DETAILS_CACHE" "$ANNOUNCEMENTS_LIST_CACHE" "$COMPUTE_HOST_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$FABRIC_CACHE"
             echo -e "${YELLOW}Cache invalidated - refreshing...${NC}"
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "true" "$filter_type" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "true" "$filter_type" "$me_view_mode" "$me_link_announcements"
             return
         fi
         
@@ -10072,21 +10199,59 @@ list_maintenance_events() {
             esac
             
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "$new_filter" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "$new_filter" "$me_view_mode" "$me_link_announcements"
             return
         fi
-        
+
         # Legacy: 'all' clears filter
         if [[ "${me_selection,,}" == "all" ]]; then
             rm -f "$me_inst_temp"
-            list_maintenance_events "$compartment_id" "$region" "false" "none" "$me_view_mode"
+            list_maintenance_events "$compartment_id" "$region" "false" "none" "$me_view_mode" "$me_link_announcements"
             return
         fi
-        
-        # Show announcements list again
-        if [[ "$me_selection" == "list" ]]; then
+
+        # Toggle announcement linking
+        if [[ "${me_selection,,}" == "ann" ]]; then
+            local _new_ann="true"
+            [[ "$me_link_announcements" == "true" ]] && _new_ann="false"
+            rm -f "$me_inst_temp"
+            list_maintenance_events "$compartment_id" "$region" "false" "$filter_type" "$me_view_mode" "$_new_ann"
+            return
+        fi
+
+        # Show taint details on demand
+        if [[ "${me_selection,,}" == "taints" ]]; then
+            if [[ $_me_tainted_count -eq 0 ]]; then
+                echo -e "${GRAY}No tainted nodes found${NC}"
+            else
+                echo ""
+                _ui_subheader "Taint Details (${_me_tainted_count} nodes)" 0
+                for ((ti=1; ti<=me_idx; ti++)); do
+                    local ti_info="${ME_EVENT_MAP[$ti]:-}"
+                    [[ -z "$ti_info" ]] && continue
+                    local ti_inst_name ti_k8s_node
+                    ti_inst_name=$(echo "$ti_info" | cut -d'|' -f10)
+                    ti_k8s_node=$(echo "$ti_info" | cut -d'|' -f11)
+                    if [[ "$ti_k8s_node" != "N/A" && -n "$ti_k8s_node" ]]; then
+                        local ti_k8s_match
+                        ti_k8s_match=$(echo "$me_k8s_lookup" | grep "$ti_k8s_node" 2>/dev/null | head -1)
+                        local ti_taint_count ti_taint_names
+                        ti_taint_count=$(echo "$ti_k8s_match" | cut -d'|' -f5)
+                        ti_taint_names=$(echo "$ti_k8s_match" | cut -d'|' -f6)
+                        if [[ -n "$ti_taint_names" && "$ti_taint_count" -gt 0 ]] 2>/dev/null; then
+                            echo -e "  ${YELLOW}#$ti${NC} ${WHITE}${ti_inst_name:0:30}${NC}: ${GRAY}${ti_taint_names}${NC}"
+                        fi
+                    fi
+                done
+                echo ""
+            fi
+            continue
+        fi
+
+        # Show announcements list again (only when linked)
+        if [[ "$me_selection" == "list" && "$me_link_announcements" == "true" ]]; then
             echo ""
-            _ui_subheader "Announcement Details" 0
+            _ui_subheader "Linked Announcements" 0
             echo ""
             printf "${BOLD}%-4s %-10s %-15s %-20s %-20s %-115s${NC}\n" \
                 "ID" "Ticket" "Type" "Start" "End" "Description"
@@ -10096,12 +10261,11 @@ list_maintenance_events() {
                 [[ -z "$la_info" ]] && continue
                 local la_ticket la_file
                 IFS='|' read -r la_ticket la_file <<< "$la_info"
-                if [[ -n "$la_file" && -f "$la_file" ]]; then
-                    local la_type la_start la_end la_desc
-                    la_type=$(jq -r '.data["announcement-type"] // "N/A"' "$la_file" 2>/dev/null)
-                    la_start=$(jq -r '.data["time-one-value"] // "N/A"' "$la_file" 2>/dev/null)
-                    la_end=$(jq -r '.data["time-two-value"] // "N/A"' "$la_file" 2>/dev/null)
-                    la_desc=$(jq -r '.data.description // "N/A"' "$la_file" 2>/dev/null)
+                # Use pre-built map for O(1) lookup instead of per-row jq calls
+                local la_ann_info="${_ME_ANN_DATA[$la_ticket]:-}"
+                if [[ -n "$la_ann_info" ]]; then
+                    local la_type la_start la_end la_desc _la_f
+                    IFS=$'\t' read -r la_type la_start la_end la_desc _la_f <<< "$la_ann_info"
                     local la_s="${la_start:0:16}" la_e="${la_end:0:16}"
                     [[ "$la_start" == "N/A" || "$la_start" == "null" ]] && la_s="-"
                     [[ "$la_end" == "N/A" || "$la_end" == "null" ]] && la_e="-"
@@ -10349,9 +10513,10 @@ list_maintenance_events() {
         #----------------------------------------------------------------------
         if [[ "$me_selection" =~ ^pods[[:space:]]+(.*) ]]; then
             local pods_targets="${BASH_REMATCH[1]}"
-            
+            $DEBUG_MODE && echo -e "${GRAY}[DEBUG] pods: me_idx=$me_idx ME_EVENT_MAP_size=${#ME_EVENT_MAP[@]} targets=$pods_targets${NC}" >&2
+
             local pods_valid=() pods_invalid=() pods_non_k8s=()
-            
+
             # Detect target type: numeric (events) or m# (instances)
             if [[ "$pods_targets" =~ ^[0-9] || "$pods_targets" == "all" ]]; then
                 # Event-based pods: resolve event indices to k8s nodes
@@ -10448,9 +10613,39 @@ list_maintenance_events() {
         fi
         
         #----------------------------------------------------------------------
-        # Announcement details: a#
+        # Compute host details: h# — map event instance to host OCID
+        #----------------------------------------------------------------------
+        if [[ "$me_selection" =~ ^h[[:space:]]*[0-9]+$ ]]; then
+            local _h_idx="${me_selection//[^0-9]/}"
+            local _h_evt="${ME_EVENT_MAP[$_h_idx]:-}"
+            if [[ -z "$_h_evt" ]]; then
+                echo -e "${RED}Invalid event index: $_h_idx${NC}"
+                continue
+            fi
+            local _h_inst_ocid
+            _h_inst_ocid=$(cut -d'|' -f2 <<< "$_h_evt")
+            if [[ -z "$_h_inst_ocid" || "$_h_inst_ocid" == "N/A" ]]; then
+                echo -e "${RED}No instance OCID for event $_h_idx${NC}"
+                continue
+            fi
+            local _h_host_ocid="${_ME_HOST_OCID[$_h_inst_ocid]:-}"
+            if [[ -z "$_h_host_ocid" ]]; then
+                echo -e "${YELLOW}No compute host found for instance ...${_h_inst_ocid: -6}${NC}"
+                continue
+            fi
+            _ch_view_host "$_h_host_ocid"
+            [[ -n "${_NAV_JUMP:-}" ]] && return
+            continue
+        fi
+
+        #----------------------------------------------------------------------
+        # Announcement details: a# (only when announcements linked)
         #----------------------------------------------------------------------
         if [[ "$me_selection" =~ ^a[0-9]+$ ]]; then
+            if [[ "$me_link_announcements" != "true" ]]; then
+                echo -e "${YELLOW}Announcements not linked. Type 'ann' to enable.${NC}"
+                continue
+            fi
             local ann_info="${ANN_TICKET_MAP[$me_selection]:-}"
             if [[ -z "$ann_info" ]]; then
                 echo -e "${RED}Invalid selection: $me_selection${NC}"
@@ -10993,17 +11188,18 @@ list_all_announcements() {
     _ui_menu_header "ALL ANNOUNCEMENTS" \
         --color "$RED" \
         --breadcrumb "Operations" "Announcements" \
-        --cmd "oci announce announcements list --compartment-id \$COMPARTMENT_ID --all | oci announce announcements get --announcement-id \$ID (×N)" \
+        --cmd "oci announce announcements list --compartment-id \$COMPARTMENT_ID --all | oci compute instance list --compartment-id \$COMPARTMENT_ID --all | oci announce announcements get --announcement-id \$ID --region \$REGION (×N)" \
         --env \
         --cache \
-        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements"
+        "${ANNOUNCEMENTS_LIST_CACHE}|Announcements" \
+        "${INSTANCE_LIST_CACHE}|Instances"
     echo ""
     
     #==========================================================================
     # Fetch announcements list + instances (step-progress checkboxes)
     #==========================================================================
     _step_init
-    
+
     # Step 1: Announcements list (always force refresh for latest data)
     _step_active "Announcements"
     rm -f "$ANNOUNCEMENTS_LIST_CACHE"
@@ -11021,6 +11217,66 @@ list_all_announcements() {
     local _ann_ct
     _ann_ct=$(jq '.data.items | length' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null) || _ann_ct=0
     _step_complete "Announcements(${_ann_ct})"
+
+    # Step 2: Instances for resource cross-reference (shared INSTANCE_LIST_CACHE with o3)
+    if is_cache_fresh "$INSTANCE_LIST_CACHE" && [[ -s "$INSTANCE_LIST_CACHE" ]]; then
+        local _inst_ct
+        _inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _inst_ct=0
+        _step_complete "Instances(${_inst_ct}, cached)"
+    else
+        _step_active "Instances"
+        oci compute instance list \
+            --compartment-id "$compartment_id" \
+            --region "$region" \
+            --all \
+            --output json 2>/dev/null | _cache_write "$INSTANCE_LIST_CACHE"
+        local _inst_ct
+        _inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _inst_ct=0
+        _step_complete "Instances(${_inst_ct})"
+    fi
+    # Step 3: Fetch announcement details (parallel)
+    local announcement_ids
+    announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
+
+    # Only fetch detail files that are missing or empty (skip existing cached files)
+    local _ann_need_list=()
+    local _ann_id
+    local _ann_total=0
+    while IFS= read -r _ann_id; do
+        [[ -z "$_ann_id" ]] && continue
+        ((_ann_total++))
+        local _detail_file="${CACHE_DIR}/ann_${_ann_id##*.}.json"
+        [[ ! -f "$_detail_file" || ! -s "$_detail_file" ]] && _ann_need_list+=("$_ann_id")
+    done <<< "$announcement_ids"
+
+    local _ann_need=${#_ann_need_list[@]}
+
+    if [[ $_ann_need -gt 0 ]]; then
+        _step_active "Details(0/${_ann_need})"
+        local _ann_pids=()
+        local _ann_max_parallel=$OCI_MAX_PARALLEL
+        local _ann_running=0
+
+        for (( _ai=0; _ai<_ann_need; _ai++ )); do
+            (
+                local _aid="${_ann_need_list[$_ai]}"
+                local _detail_file="${CACHE_DIR}/ann_${_aid##*.}.json"
+                oci announce announcements get --announcement-id "$_aid" --region "$region" --output json > "$_detail_file" 2>/dev/null
+            ) >/dev/null 2>&1 &
+            _ann_pids+=($!)
+            ((_ann_running++))
+            if [[ $_ann_running -ge $_ann_max_parallel ]]; then
+                wait -n 2>/dev/null || true
+                ((_ann_running--))
+            fi
+        done
+
+        [[ ${#_ann_pids[@]} -gt 0 ]] && wait "${_ann_pids[@]}" 2>/dev/null
+        _step_complete "Details(${_ann_need}/${_ann_total})"
+    elif [[ $_ann_total -gt 0 ]]; then
+        _step_complete "Details(${_ann_total} cached)"
+    fi
+
     _step_finish
 
     #==========================================================================
@@ -11039,89 +11295,13 @@ list_all_announcements() {
     echo ""
 
     #==========================================================================
-    # Fetch instances for resource cross-reference (cache-first)
-    #==========================================================================
-    _step_init
-    local instances_json
-    if is_cache_fresh "$INSTANCE_LIST_CACHE" && [[ -s "$INSTANCE_LIST_CACHE" ]]; then
-        instances_json=$(cat "$INSTANCE_LIST_CACHE")
-        local _inst_ct
-        _inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _inst_ct=0
-        _step_complete "Instances(${_inst_ct}, cached)"
-    else
-        _step_active "Instances"
-        instances_json=$(oci compute instance list \
-            --compartment-id "$compartment_id" \
-            --region "$region" \
-            --all \
-            --output json 2>/dev/null)
-        if [[ -n "$instances_json" ]] && jq -e '.data' <<< "$instances_json" > /dev/null 2>&1; then
-            echo "$instances_json" | _cache_write "$INSTANCE_LIST_CACHE"
-        fi
-        local _inst_ct
-        _inst_ct=$(jq '.data | length' "$INSTANCE_LIST_CACHE" 2>/dev/null) || _inst_ct=0
-        _step_complete "Instances(${_inst_ct})"
-    fi
-    _step_finish
-
-    #==========================================================================
-    # Build instance lookup from cached data
+    # Build instance lookup from INSTANCE_LIST_CACHE
     #==========================================================================
     declare -A INSTANCE_LOOKUP
-    if [[ -n "$instances_json" ]]; then
+    if [[ -f "$INSTANCE_LIST_CACHE" && -s "$INSTANCE_LIST_CACHE" ]]; then
         while IFS='|' read -r ocid name state; do
             [[ -n "$ocid" ]] && INSTANCE_LOOKUP[$ocid]="${name}|${state}"
-        done < <(jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])"' <<< "$instances_json" 2>/dev/null)
-    fi
-    
-    #==========================================================================
-    # Fetch announcement details (parallel N+1 with progress bar)
-    #==========================================================================
-    local announcement_ids
-    announcement_ids=$(jq -r '.data.items[].id' "$ANNOUNCEMENTS_LIST_CACHE" 2>/dev/null)
-    
-    # Build ID list
-    local _ann_id_list=()
-    local _ann_id
-    while IFS= read -r _ann_id; do
-        [[ -n "$_ann_id" ]] && _ann_id_list+=("$_ann_id")
-    done <<< "$announcement_ids"
-    
-    local _ann_total=${#_ann_id_list[@]}
-    
-    if [[ $_ann_total -gt 0 ]]; then
-        echo -e "  ${GRAY}Command: oci announce announcements get --announcement-id \$ID --region \$REGION  (×${_ann_total})${NC}"
-        
-        local _ann_progress_dir
-        _ann_progress_dir=$(mktemp -d "${TEMP_DIR}/ann_progress.XXXXXX")
-        local _ann_pids=()
-        local _ann_max_parallel=$OCI_MAX_PARALLEL
-        local _ann_running=0
-        
-        # Start progress bar in background (tracks marker files in temp dir)
-        _progress_start "$_ann_progress_dir" "done_*" "$_ann_total" "announcement details"
-        
-        for (( _ai=0; _ai<_ann_total; _ai++ )); do
-            (
-                local _aid="${_ann_id_list[$_ai]}"
-                local _detail_file="${CACHE_DIR}/ann_${_aid##*.}.json"
-                oci announce announcements get --announcement-id "$_aid" --region "$region" --output json > "$_detail_file" 2>/dev/null
-                # Write completion marker for progress tracking
-                touch "${_ann_progress_dir}/done_${_ai}"
-            ) >/dev/null 2>&1 &
-            _ann_pids+=($!)
-            ((_ann_running++))
-            if [[ $_ann_running -ge $_ann_max_parallel ]]; then
-                wait -n 2>/dev/null || true
-                ((_ann_running--))
-            fi
-        done
-        
-        [[ ${#_ann_pids[@]} -gt 0 ]] && wait "${_ann_pids[@]}" 2>/dev/null
-        
-        # Stop progress bar
-        _progress_done "$_ann_total" "announcement details"
-        rm -rf "${_ann_progress_dir:?}" 2>/dev/null
+        done < <(jq -r '.data[] | "\(.id)|\(.["display-name"])|\(.["lifecycle-state"])"' "$INSTANCE_LIST_CACHE" 2>/dev/null)
     fi
     
     # ── Display function (called for default filtered + show-all) ──
@@ -31701,13 +31881,13 @@ _ANN_ENABLED_INDICES=()
 
 # ── Column config — ME (Maintenance Events, --manage o,3) ──
 _ME_COL_CONF="$ME_COLUMNS_CONF"
-_ME_COL_KEYS=(           "id"     "inst_name"  "k8s_node"   "serial"     "state"    "k8s"    "cordon"  "taints"  "pods"   "reason"     "category"   "lifecycle"  "event_name"  "window"     "finished"     "resched" "announce"  "fault_code"  "comp_host"  )
-_ME_COL_LABELS=(         "#"      "Instance Name" "K8s Node" "Serial"   "State"    "K8s"    "Crdn"    "Taints"  "Pods"   "Maint Reason" "Category" "Lifecycle"  "Event Name"  "Window Start" "Time Finished" "Re"   "Announce"  "Fault Code"  "CompHost"   )
-_ME_COL_DEFAULT_WIDTHS=( 4        25           20           14           10         8        6         8         5        22           12           11           28            20           20             4         10          22            10           )
-_ME_COL_WIDTHS=(         4        25           20           14           10         8        6         8         5        22           12           11           28            20           20             4         10          22            10           )
-_ME_COL_ALIGN=(          "-"      "-"          "-"          "-"          "-"        "-"      "-"       "-"       "-"      "-"          "-"          "-"          "-"           "-"          "-"            "-"       "-"         "-"           "-"          )
-_ME_COL_FMTS=(           "%-4.4s" "%-25.25s"   "%-20.20s"   "%-14.14s"   "%-10.10s" "%-8.8s" "%-6.6s"  "%-8.8s"  "%-5.5s" "%-22.22s"   "%-12.12s"   "%-11.11s"   "%-28.28s"    "%-20.20s"   "%-20.20s"     "%-4.4s"  "%-10.10s"  "%-22.22s"    "%-10.10s"   )
-_ME_COL_COLORS=(         "YELLOW" ""           "@1"         "@2"         "@3"       "@4"     "@5"      "@6"      "@7"     "@8"         ""           "@9"         ""            "@10"        "@11"          "@12"     "@13"       "@14"         "@15"        )
+_ME_COL_KEYS=(           "id"     "inst_name"  "k8s_node"   "serial"     "state"    "k8s"    "cordon"  "taints"  "pods"   "reason"     "category"   "lifecycle"  "event_name"  "window"     "finished"     "resched" "announce"  "fault_code"  "comp_host"  "evt_ocid"     "inst_ocid"    "gpu_cluster"  )
+_ME_COL_LABELS=(         "#"      "Instance Name" "K8s Node" "Serial"   "State"    "K8s"    "Crdn"    "Taints"  "Pods"   "Maint Reason" "Category" "Lifecycle"  "Event Name"  "Window Start" "Time Finished" "Re"   "Announce"  "Fault Code"  "CompHost"   "Event OCID"   "Instance OCID" "GPU Cluster"  )
+_ME_COL_DEFAULT_WIDTHS=( 4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             9              )
+_ME_COL_WIDTHS=(         4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             9              )
+_ME_COL_ALIGN=(          "-"      "-"          "-"          "-"          "-"        "-"      "-"       "-"       "-"      "-"          "-"          "-"          "-"           "-"          "-"            "-"       "-"         "-"           "-"          "-"            "-"            "-"            )
+_ME_COL_FMTS=(           "%-4.4s" "%-25.25s"   "%-20.20s"   "%-14.14s"   "%-10.10s" "%-8.8s" "%-6.6s"  "%-8.8s"  "%-5.5s" "%-22.22s"   "%-12.12s"   "%-11.11s"   "%-28.28s"    "%-20.20s"   "%-20.20s"     "%-4.4s"  "%-10.10s"  "%-22.22s"    "%-10.10s"   "%-45.45s"     "%-45.45s"     "%-30.30s"     )
+_ME_COL_COLORS=(         "YELLOW" ""           "@1"         "@2"         "@3"       "@4"     "@5"      "@6"      "@7"     "@8"         ""           "@9"         ""            "@10"        "@11"          "@12"     "@13"       "@14"         "@15"        "@16"          "@17"          "@18"          )
 _ME_COL_LOCKED=( "id" )
 _ME_COL_DEFAULTS=( "id" "inst_name" "k8s_node" "serial" "state" "k8s" "cordon" "taints" "pods" "reason" "lifecycle" "event_name" "window" "finished" "resched" "fault_code" "comp_host" )
 
@@ -46576,7 +46756,7 @@ _render_dedicated_pool_ext() {
         if (ad == "" || ad == "N/A") ad = "(unknown-ad)"
         key = shape "|" ad
         total[key]++
-        if ($8 == "N/A" || $8 == "") unocc[key]++
+        if ($2 == "AVAILABLE") unocc[key]++
     } END {
         for (k in total) printf "%s|%d|%d\n", k, total[k], unocc[k]+0
     }' | sort -t'|' -k1,1 > "$_dp_agg"
@@ -46636,7 +46816,9 @@ _render_dedicated_pool_ext() {
             local _dp_key="${_dps}|${_ads}"
             local _dp_un="${_dp_unocc[$_dp_key]:-0}"
 
-            # Cap column: ✓(n) if unoccupied hosts exist, ✗ if none
+            local _dp_total="${_dp_hosts[$_dp_key]:-0}"
+
+            # Cap = AVAILABLE hosts, Used = occupied hosts, Limit = total hosts
             local _cap_str="✗"
             if [[ "$_dp_un" -gt 0 ]] 2>/dev/null; then
                 _cap_str="✓(${_dp_un})"
@@ -46646,27 +46828,16 @@ _render_dedicated_pool_ext() {
             [[ "$_cap_str" == ✓* ]] && _cap_display="${GREEN}${_cap_str}${NC}"
             local _cw_color=21
 
-            # Used / Limit from resource-availability API
-            local _uv="-" _av="-"
-            if [[ -n "$_dp_lname" ]]; then
-                local _ra_data
-                _ra_data=$(_rpt_ra "compute" "$_dp_lname" "$_ads")
-                local _lv_raw
-                IFS='|' read -r _lv_raw _uv _av <<< "$_ra_data"
-            fi
-            _uv=$(_rpt_fnum "$_uv"); _av=$(_rpt_fnum "$_av")
+            local _uv=$(( _dp_total - _dp_un ))
+            local _lv="$_dp_total"
 
-            if [[ "$_uv" == "ERR" || "$_uv" == "RATE" || "$_uv" == "DENY" ]]; then
-                printf " %${_cw_color}b ${RED}%7s %7s${NC}" "$_cap_display" "$_uv" "$_av"
-            else
-                printf " %${_cw_color}b %7s %7s" "$_cap_display" "$_uv" "$_av"
-            fi
+            printf " %${_cw_color}b %7s %7s" "$_cap_display" "$_uv" "$_lv"
         done
         echo ""
     done
 
     echo ""
-    echo -e "  ${GRAY}Cap: Unoccupied dedicated hosts in this AD — ✓(n)=n available, ✗=none${NC}"
+    echo -e "  ${GRAY}Cap: AVAILABLE hosts  Used: occupied hosts  Limit: total dedicated hosts${NC}"
 }
 
 #--------------------------------------------------------------------------------
@@ -46683,7 +46854,7 @@ _limits_gpu_report() {
         echo ""
         _ui_menu_header "COMPUTE STANDARD CAPACITY" \
             --breadcrumb "Operations" "Service Limits" "Compute Capacity" \
-            --cmd "oci limits resource-availability get --service-name <svc> --limit-name <limit> --compartment-id \$TENANCY_ID --availability-domain <AD> | oci compute compute-capacity-report create | oci compute compute-host list" \
+            --cmd "oci limits resource-availability get --service-name <svc> --limit-name <limit> --compartment-id \$TENANCY_ID --availability-domain \$AD | oci compute compute-capacity-report create | oci compute compute-host list" \
             --env \
             --cache "${COMPUTE_LIMITS_CACHE}|Limits Catalog" --cache "${COMPUTE_HOST_CACHE}|Compute Hosts"
         
@@ -46779,7 +46950,7 @@ _limits_gpu_report() {
         if [[ -z "$_filter" ]]; then
             if ! is_cache_fresh "$COMPUTE_LIMITS_CACHE" 2>/dev/null || [[ ! -s "$COMPUTE_LIMITS_CACHE" ]]; then
                 _step_active "limits catalog"
-                local _j; _j=$(oci limits value list --service-name compute --compartment-id "$tenancy_id" --region "$region" --scope-type AD --all --output json 2>/dev/null)
+                local _j; _j=$(oci limits value list --service-name compute --compartment-id "$tenancy_id" --region "$region" --all --output json 2>/dev/null)
                 [[ -n "$_j" ]] && jq -e '.data' <<< "$_j" >/dev/null 2>&1 && echo "$_j" | _cache_write "$COMPUTE_LIMITS_CACHE"
                 _step_complete "limits catalog"
             fi
@@ -46865,13 +47036,14 @@ _limits_gpu_report() {
                     else
                         _sh_json=$(jq -nc --arg s "$_sh" '[{"instanceShape":$s}]')
                     fi
+                    echo "$_sh" > "$_gtmp/ad_${_adi}/s_${_si}.shape"
                     _rpt_throttle
                     (oci compute compute-capacity-report create \
                         --compartment-id "$tenancy_id" \
                         --availability-domain "$_ad" \
                         --region "$region" \
                         --shape-availabilities "$_sh_json" \
-                        --output json > "$_gtmp/ad_${_adi}/s_${_si}.json" 2>/dev/null
+                        --output json > "$_gtmp/ad_${_adi}/s_${_si}.json" 2>"$_gtmp/ad_${_adi}/s_${_si}.err"
                      touch "$_gtmp/ad_${_adi}/s_${_si}.done") &
                     _fetch_pids+=($!)
                     ((_si++))
@@ -46992,9 +47164,38 @@ _limits_gpu_report() {
             [[ ${#_v} -ge 13 ]] && { echo "unlim"; return; }
             echo "$_v"
         }
-        
+
+        # Build limit value lookup: _LV[limit_name|AD_short] = total limit value
+        # Source: oci limits value list (COMPUTE_LIMITS_CACHE)
+        declare -A _LV=()
+        if [[ -s "$COMPUTE_LIMITS_CACHE" ]]; then
+            while IFS='|' read -r _lv_name _lv_val _lv_ad; do
+                [[ -z "$_lv_name" || -z "$_lv_ad" ]] && continue
+                local _lv_ad_short="${_lv_ad##*:}"
+                [[ -z "$_lv_ad_short" ]] && _lv_ad_short="${_lv_ad##*-}"
+                _LV["${_lv_name}|${_lv_ad_short}"]="$_lv_val"
+            done < <(python3 -c "
+import sys, json
+with open('$COMPUTE_LIMITS_CACHE') as f:
+    d = json.load(f)
+for x in d.get('data', []):
+    ad = x.get('availability-domain') or ''
+    print(f\"{x['name']}|{x.get('value','')}|{ad}\")
+" 2>/dev/null)
+        fi
+
+        # Lookup total limit value for a limit in a specific AD
+        # Returns: limit value or "-"
+        _rpt_lv() {
+            local _lname="$1" _ad_key="$2"
+            local _v="${_LV[${_lname}|${_ad_key}]:-}"
+            [[ -z "$_v" ]] && { echo "-"; return; }
+            _rpt_fnum "$_v"
+        }
+
         # ── Fetch diagnostics ──
         local _ra_ok=0 _ra_err=0 _ra_rate=0
+        local -a _failed_calls=()
         for _rf in "$_gtmp"/ra_*.json; do
             [[ ! -f "$_rf" ]] && continue
             if [[ -s "$_rf" ]] && jq -e '.data' "$_rf" >/dev/null 2>&1; then
@@ -47002,12 +47203,45 @@ _limits_gpu_report() {
             else
                 ((_ra_err++))
                 local _ef="${_rf%.json}.err"
-                [[ -s "$_ef" ]] && grep -q "TooManyRequests\|429" "$_ef" 2>/dev/null && ((_ra_rate++))
+                if [[ -s "$_ef" ]]; then
+                    [[ -s "$_ef" ]] && grep -q "TooManyRequests\|429" "$_ef" 2>/dev/null && ((_ra_rate++))
+                    _oci_parse_error "$_ef"
+                    # Extract limit+AD from filename: ra_compute_<limit>_<AD>.json
+                    local _rf_base="${_rf##*/}"; _rf_base="${_rf_base%.json}"
+                    local _rf_ad="${_rf_base##*_}"
+                    local _rf_limit="${_rf_base#ra_compute_}"; _rf_limit="${_rf_limit%_*}"
+                    _failed_calls+=("oci limits resource-availability get --limit-name ${_rf_limit} --availability-domain ${_rf_ad}|${_OCI_ERR_CODE:-unknown}|${_OCI_ERR_MSG:-API call failed}")
+                fi
             fi
         done
-        
-        if [[ $_ra_err -gt 0 ]]; then
-            echo -e "  ${YELLOW}⚠ API Results:${NC} ${GREEN}${_ra_ok} succeeded${NC}  ${RED}${_ra_err} failed${NC}$( [[ $_ra_rate -gt 0 ]] && echo -e "  ${YELLOW}(${_ra_rate} rate-limited — try 'r' to refresh)${NC}" )"
+
+        # Check capacity report errors
+        local _cap_ok=0 _cap_err=0
+        for _cap_ef in "$_gtmp"/ad_*/s_*.err; do
+            [[ ! -f "$_cap_ef" ]] && continue
+            [[ ! -s "$_cap_ef" ]] && { ((_cap_ok++)); continue; }
+            ((_cap_err++))
+            _oci_parse_error "$_cap_ef"
+            local _cap_shape_f="${_cap_ef%.err}.shape"
+            local _cap_shape_name="-"
+            [[ -s "$_cap_shape_f" ]] && _cap_shape_name=$(<"$_cap_shape_f")
+            # Extract AD index from path: ad_<idx>/s_<idx>.err
+            local _cap_dir="${_cap_ef%/*}"; _cap_dir="${_cap_dir##*/}"
+            local _cap_adi="${_cap_dir#ad_}"
+            local _cap_ad_name="${_ad_short[$_cap_adi]:-AD-?}"
+            _failed_calls+=("oci compute compute-capacity-report create --shape ${_cap_shape_name} --availability-domain ${_cap_ad_name}|${_OCI_ERR_CODE:-unknown}|${_OCI_ERR_MSG:-API call failed}")
+        done
+
+        local _total_err=$(( _ra_err + _cap_err ))
+        if [[ $_total_err -gt 0 ]]; then
+            echo -e "  ${YELLOW}⚠ API Results:${NC} ${GREEN}$(( _ra_ok + _cap_ok )) succeeded${NC}  ${RED}${_total_err} failed${NC}$( [[ $_ra_rate -gt 0 ]] && echo -e "  ${YELLOW}(${_ra_rate} rate-limited — try 'r' to refresh)${NC}" )"
+            echo ""
+            for _fc in "${_failed_calls[@]}"; do
+                local _fc_cmd _fc_code _fc_msg
+                IFS='|' read -r _fc_cmd _fc_code _fc_msg <<< "$_fc"
+                echo -e "  ${RED}✗${NC} ${WHITE}${_fc_cmd}${NC}"
+                echo -e "    ${RED}${_fc_code}:${NC} ${GRAY}${_fc_msg}${NC}"
+            done
             echo ""
         fi
         
@@ -47129,16 +47363,17 @@ _limits_gpu_report() {
                 fi
                 _shape_cap_strs+=("$_cap_str")
 
-                # Get resource-availability for this shape's limit
-                local _ra_data _uv _av
+                # Get resource-availability (used) and limit value (total)
+                local _ra_data _uv _lv
                 if [[ -n "$_lmap" ]]; then
                     _ra_data=$(_rpt_ra "compute" "$_lmap" "${_ad_short[$_adi]}")
-                    local _lv_raw
-                    IFS='|' read -r _lv_raw _uv _av <<< "$_ra_data"
+                    local _lv_raw _av_raw
+                    IFS='|' read -r _lv_raw _uv _av_raw <<< "$_ra_data"
+                    _lv=$(_rpt_lv "$_lmap" "${_ad_short[$_adi]}")
                 else
-                    _uv="-"; _av="-"
+                    _uv="-"; _lv="-"
                 fi
-                _uv=$(_rpt_fnum "$_uv"); _av=$(_rpt_fnum "$_av")
+                _uv=$(_rpt_fnum "$_uv")
 
                 # All cap symbols are UTF-8 (✓✗ = 3 bytes, 1 display char) + ANSI color (11 bytes)
                 # Base width 10 = 8 display + 2 UTF-8 overhead; +11 for color escapes = 21
@@ -47147,9 +47382,9 @@ _limits_gpu_report() {
                 local _cw_color=21
 
                 if [[ "$_uv" == "ERR" || "$_uv" == "RATE" || "$_uv" == "DENY" ]]; then
-                    printf " %${_cw_color}b ${RED}%7s %7s${NC}" "$_cap_display" "$_uv" "$_av"
+                    printf " %${_cw_color}b ${RED}%7s %7s${NC}" "$_cap_display" "$_uv" "$_lv"
                 else
-                    printf " %${_cw_color}b %7s %7s" "$_cap_display" "$_uv" "$_av"
+                    printf " %${_cw_color}b %7s %7s" "$_cap_display" "$_uv" "$_lv"
                 fi
                 ((_adi++))
             done
@@ -47170,13 +47405,14 @@ _limits_gpu_report() {
                 _adi=0
                 for _ad in "${_ad_list[@]}"; do
                     local _ra_data; _ra_data=$(_rpt_ra "compute" "$_el" "${_ad_short[$_adi]}")
-                    local _lv_raw
-                    IFS='|' read -r _lv_raw _uv _av <<< "$_ra_data"
-                    _uv=$(_rpt_fnum "$_uv"); _av=$(_rpt_fnum "$_av")
+                    local _lv_raw _av_raw
+                    IFS='|' read -r _lv_raw _uv _av_raw <<< "$_ra_data"
+                    _uv=$(_rpt_fnum "$_uv")
+                    local _lv; _lv=$(_rpt_lv "$_el" "${_ad_short[$_adi]}")
                     if [[ "$_uv" == "ERR" || "$_uv" == "RATE" || "$_uv" == "DENY" ]]; then
-                        printf " ${RED}%8s %7s %7s${NC}" "" "$_uv" "$_av"
+                        printf " ${RED}%8s %7s %7s${NC}" "" "$_uv" "$_lv"
                     else
-                        printf " %8s %7s %7s" "" "$_uv" "$_av"
+                        printf " %8s %7s %7s" "" "$_uv" "$_lv"
                     fi
                     ((_adi++))
                 done
@@ -47198,7 +47434,7 @@ _limits_gpu_report() {
         echo -e "  ${GRAY}Cap:   Physical hardware available right now — ✓(n)=n hosts, ✓=available (count not reported), ✗=no capacity${NC}"
         echo -e "  ${GRAY}       Flex shapes: capacity probed at ${WHITE}${CAPACITY_FLEX_OCPUS} OCPU / ${CAPACITY_FLEX_MEMORY} GB${GRAY} (change with ${WHITE}f${GRAY})${NC}"
         echo -e "  ${GRAY}Used:  Consumed from your tenancy service limit${NC}"
-        echo -e "  ${GRAY}Limit: Remaining tenancy service limit — to provision, need both Cap=✓ AND Limit>0${NC}"
+        echo -e "  ${GRAY}Limit: Total tenancy service limit for this AD — to provision, need both Cap=✓ AND Used<Limit${NC}"
 
         # ── Dedicated Pool (from Compute Hosts) ──
         [[ -n "$_ct_fetch_pid" ]] && wait "$_ct_fetch_pid" 2>/dev/null
