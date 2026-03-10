@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.26.7"
+readonly SCRIPT_VERSION="3.26.8"
 readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -10009,49 +10009,63 @@ list_maintenance_events() {
     done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
     
     echo ""
-    echo -e "${GRAY}Total: ${WHITE}${me_idx}${GRAY} maintenance event(s)${NC}"
+    _ui_subheader "Summary" 0
+    echo ""
+    echo -e "  ${WHITE}Total:${NC} ${GREEN}${me_idx}${NC} ${GRAY}maintenance event(s)${NC}"
 
     # Summary by fault code with lifecycle breakdown
     if [[ ${#_me_fault_counts[@]} -gt 0 ]]; then
         echo ""
-        echo -e "${GRAY}By Fault Code:${NC}"
+        echo -e "  ${BOLD}${WHITE}By Fault Code:${NC}"
+        printf "  ${BOLD}${WHITE}%-26s %6s  %-s${NC}\n" "Fault Code" "Nodes" "Lifecycle"
+        printf "  ${GRAY}%-26s %6s  %-s${NC}\n" "--------------------------" "------" "-----------------------------"
         local _fc_key
         while IFS= read -r _fc_key; do
             [[ -z "$_fc_key" ]] && continue
-            printf "  ${CYAN}%-28s${NC} ${WHITE}%4d${NC} ${GRAY}node(s)${NC}" "$_fc_key" "${_me_fault_counts[$_fc_key]}"
-            # Inline lifecycle counts
             local _fl_parts=""
             local _fl_key
             while IFS= read -r _fl_key; do
                 [[ -z "$_fl_key" ]] && continue
                 local _fl_fc="${_fl_key%%|*}" _fl_lc="${_fl_key#*|}"
                 [[ "$_fl_fc" != "$_fc_key" ]] && continue
-                _fl_parts="${_fl_parts} ${_fl_lc}:${_me_fault_lc_counts[$_fl_key]}"
+                local _fl_lc_c="${GRAY}"
+                case "$_fl_lc" in
+                    SCHEDULED) _fl_lc_c="${YELLOW}" ;;
+                    SUCCEEDED) _fl_lc_c="${GREEN}" ;;
+                    CANCELED)  _fl_lc_c="${GRAY}" ;;
+                    FAILED)    _fl_lc_c="${RED}" ;;
+                esac
+                _fl_parts="${_fl_parts} ${_fl_lc_c}${_fl_lc}:${_me_fault_lc_counts[$_fl_key]}${NC}"
             done < <(printf '%s\n' "${!_me_fault_lc_counts[@]}" | sort)
-            [[ -n "$_fl_parts" ]] && printf "  ${GRAY}(%s )${NC}" "$_fl_parts"
-            printf "\n"
+            printf "  ${CYAN}%-26s${NC} ${WHITE}%6d${NC}  ${GRAY}(${NC}%b ${GRAY})${NC}\n" "$_fc_key" "${_me_fault_counts[$_fc_key]}" "$_fl_parts"
         done < <(printf '%s\n' "${!_me_fault_counts[@]}" | sort)
     fi
 
     # Summary by GPU memory cluster with fault code + lifecycle breakdown
     if [[ ${#_me_cluster_counts[@]} -gt 0 ]]; then
         echo ""
-        echo -e "${GRAY}By GPU Cluster:${NC}"
+        echo -e "  ${BOLD}${WHITE}By GPU Fabric:${NC}"
+        printf "  ${BOLD}${WHITE}%-26s %6s  %-s${NC}\n" "Fabric" "Nodes" "Lifecycle"
+        printf "  ${GRAY}%-26s %6s  %-s${NC}\n" "--------------------------" "------" "-----------------------------"
         local _gc_key
         while IFS= read -r _gc_key; do
             [[ -z "$_gc_key" ]] && continue
-            printf "  ${CYAN}%-28s${NC} ${WHITE}%4d${NC} ${GRAY}node(s)${NC}" "$_gc_key" "${_me_cluster_counts[$_gc_key]}"
-            # Inline lifecycle counts for this cluster
             local _cl_parts=""
             local _cl_key
             while IFS= read -r _cl_key; do
                 [[ -z "$_cl_key" ]] && continue
                 local _cl_gc="${_cl_key%%|*}" _cl_lc="${_cl_key#*|}"
                 [[ "$_cl_gc" != "$_gc_key" ]] && continue
-                _cl_parts="${_cl_parts} ${_cl_lc}:${_me_cluster_lc_counts[$_cl_key]}"
+                local _cl_lc_c="${GRAY}"
+                case "$_cl_lc" in
+                    SCHEDULED) _cl_lc_c="${YELLOW}" ;;
+                    SUCCEEDED) _cl_lc_c="${GREEN}" ;;
+                    CANCELED)  _cl_lc_c="${GRAY}" ;;
+                    FAILED)    _cl_lc_c="${RED}" ;;
+                esac
+                _cl_parts="${_cl_parts} ${_cl_lc_c}${_cl_lc}:${_me_cluster_lc_counts[$_cl_key]}${NC}"
             done < <(printf '%s\n' "${!_me_cluster_lc_counts[@]}" | sort)
-            [[ -n "$_cl_parts" ]] && printf "  ${GRAY}(%s )${NC}" "$_cl_parts"
-            printf "\n"
+            printf "  ${MAGENTA}%-26s${NC} ${WHITE}%6d${NC}  ${GRAY}(${NC}%b ${GRAY})${NC}\n" "$_gc_key" "${_me_cluster_counts[$_gc_key]}" "$_cl_parts"
             # Sub-lines: fault codes within this cluster
             local _cf_key
             while IFS= read -r _cf_key; do
@@ -10059,7 +10073,7 @@ list_maintenance_events() {
                 local _cf_cluster="${_cf_key%%|*}"
                 local _cf_fault="${_cf_key#*|}"
                 [[ "$_cf_cluster" != "$_gc_key" ]] && continue
-                printf "    ${GRAY}↳${NC} ${YELLOW}%-24s${NC} ${WHITE}%4d${NC}\n" "$_cf_fault" "${_me_cluster_fault_counts[$_cf_key]}"
+                printf "    ${GRAY}↳${NC} ${YELLOW}%-22s${NC} ${WHITE}%6d${NC}\n" "$_cf_fault" "${_me_cluster_fault_counts[$_cf_key]}"
             done < <(printf '%s\n' "${!_me_cluster_fault_counts[@]}" | sort)
         done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
     fi
