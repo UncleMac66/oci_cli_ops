@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.25.96"
+readonly SCRIPT_VERSION="3.26.7"
 readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -31529,7 +31529,13 @@ _col_print_row() {
         fi
         _args+=("${_vals[$_idx]}")
     done
-    printf "${_fmt_str}\n" "${_args[@]}"
+    if [[ -n "${_COL_ROW_SUFFIX:-}" ]]; then
+        printf "${_fmt_str}" "${_args[@]}"
+        printf "  %b\n" "$_COL_ROW_SUFFIX"
+        _COL_ROW_SUFFIX=""
+    else
+        printf "${_fmt_str}\n" "${_args[@]}"
+    fi
 }
 
 # Print a plain-text row (no colors) for search highlighting
@@ -31814,7 +31820,7 @@ _CHOST_COL_FMTS=(           "%-4.4s" "%-28.28s"        "%-10.10s" "%-10.10s" "%-
 _CHOST_COL_COLORS=(         "YELLOW" "WHITE"           "@1"       "@2"       "@3"        ""         "GRAY"      "@4"       "@5"       "@6"        "@7"     "GRAY"   "GRAY"   "YELLOW"        "GRAY"         )
 _CHOST_COL_LOCKED=( "id" )
 # Columns enabled by default (name, platform, instance disabled; user can toggle via col)
-_CHOST_COL_DEFAULT_ENABLED=( "id" "state" "health" "impacted" "shape" "k8s" "cordon" "taint" "pods" "ad" "fd" "hostocid" "instance" )
+_CHOST_COL_DEFAULT_ENABLED=( "id" "state" "health" "shape" "k8s" "cordon" "taint" "pods" "ad" "fd" "hostocid" )
 
 # Format globals — CHOST (Compute Host Views)
 _CHOST_ENABLED_COLS=()
@@ -35850,7 +35856,6 @@ display_instance_details() {
             local _ch_ad_short="${_ch_ad##*:}"
             local _ch_fd_short="${_ch_fd##*FAULT-DOMAIN-}"
             [[ "$_ch_fd_short" == "$_ch_fd" ]] && _ch_fd_short="${_ch_fd##*-}"
-            printf "${WHITE}%-18s${NC}${WHITE}AD:${NC} %-14s ${WHITE}FD:${NC} %s\n" "" "$_ch_ad_short" "FD-${_ch_fd_short}"
             # RDMA topology line (only if any topology IDs exist)
             local _ch_topo_parts=()
             [[ -n "$_ch_hpc" && "$_ch_hpc" != "N/A" ]]           && _ch_topo_parts+=("${WHITE}HPC:${GRAY}..${_ch_hpc: -5}${NC}")
@@ -35859,7 +35864,10 @@ display_instance_details() {
             [[ -n "$_ch_gpu_fabric" && "$_ch_gpu_fabric" != "N/A" ]] && _ch_topo_parts+=("${WHITE}GPUFab:${GRAY}..${_ch_gpu_fabric: -5}${NC}")
             if [[ ${#_ch_topo_parts[@]} -gt 0 ]]; then
                 local _ch_topo_str="${_ch_topo_parts[*]}"
-                printf "${WHITE}%-18s${NC}%b\n" "  RDMA Topology:" "$_ch_topo_str"
+                printf "${WHITE}%-18s${NC}${WHITE}AD:${NC} %-14s ${WHITE}FD:${NC} %s\n" "RDMA Topology:" "$_ch_ad_short" "FD-${_ch_fd_short}"
+                printf "${WHITE}%-18s${NC}%b\n" "" "$_ch_topo_str"
+            else
+                printf "${WHITE}%-18s${NC}${WHITE}AD:${NC} %-14s ${WHITE}FD:${NC} %s\n" "" "$_ch_ad_short" "FD-${_ch_fd_short}"
             fi
         fi
         if [[ -n "$gpu_mem_cluster" ]]; then
@@ -54993,8 +55001,9 @@ _ch_fetch_k8s_data() {
     _CH_K8S_MAP=()
     _CH_PODS_MAP=()
 
-    # Check if kubectl is available
+    # Check if kubectl is available and has a current context
     command -v kubectl &>/dev/null || return 0
+    kubectl config current-context &>/dev/null || return 0
 
     _step_active "k8s nodes"
     local _k8s_tmp="${TEMP_DIR}/ch_k8s_nodes_$$" _pods_tmp="${TEMP_DIR}/ch_k8s_pods_$$"
@@ -55173,21 +55182,32 @@ _ch_print_host_row() {
                     _row_imp_mt=$(echo "$_row_imp_line" | cut -d'|' -f2)
                     _row_imp_rl=$(echo "$_row_imp_line" | cut -d'|' -f3)
                     _row_imp_comps=$(echo "$_row_imp_line" | cut -d'|' -f4)
+                    declare -A _row_imp_agg=()
                     IFS=';' read -ra _row_imp_arr <<< "$_row_imp_comps"
                     for _ric in "${_row_imp_arr[@]}"; do
                         [[ -z "$_ric" ]] && continue
                         local _ric_type _ric_act _ric_fid _ric_sev
                         IFS=':' read -r _ric_type _ric_act _ric_fid _ric_sev <<< "$_ric"
-                        [[ -n "$_row_imp_detail" ]] && _row_imp_detail+=", "
-                        _row_imp_detail+="${_ric_type}/${_ric_act} ${_ric_fid}"
+                        local _ric_key="${_ric_fid}|${_ric_type}/${_ric_act}"
+                        _row_imp_agg["$_ric_key"]=$(( ${_row_imp_agg["$_ric_key"]:-0} + 1 ))
                     done
+                    for _rk in "${!_row_imp_agg[@]}"; do
+                        local _rk_fid="${_rk%%|*}" _rk_label="${_rk#*|}" _rk_ct="${_row_imp_agg[$_rk]}"
+                        [[ -n "$_row_imp_detail" ]] && _row_imp_detail+=", "
+                        if [[ "$_rk_ct" -gt 1 ]]; then
+                            _row_imp_detail+="${_rk_fid} ×${_rk_ct} ${_rk_label}"
+                        else
+                            _row_imp_detail+="${_rk_fid} ${_rk_label}"
+                        fi
+                    done
+                    unset _row_imp_agg
                     if [[ -n "$_row_imp_detail" ]]; then
                         _row_imp_tag="Impacted: ${_row_imp_detail}"
-                        [[ -n "$_row_imp_rl" && "$_row_imp_rl" != "N/A" ]] && _row_imp_tag+=" | ${_row_imp_rl}"
+                        # recycle level omitted for brevity
                     fi
                 fi
             fi
-            host_display="${host_ocid} [${_row_imp_tag}]"
+            host_display="${host_ocid} ${LIGHT_RED}[${_row_imp_tag}]${NC}"
         else
             host_display="$host_ocid"
         fi
@@ -55364,12 +55384,12 @@ _ch_post_table_actions() {
     local view_label="$1" search_ctx="${2:-all}"
 
     # Build jq filter for JSON viewer based on search context
-    local _jq_filter=".data"
+    local _jq_filter=".data.items"
     case "$search_ctx" in
-        state:*)  _jq_filter="[.data[] | select(.\"lifecycle-state\" == \"${search_ctx#state:}\")]" ;;
-        health:*) _jq_filter="[.data[] | select(.health == \"${search_ctx#health:}\")]" ;;
-        shape:*)  _jq_filter="[.data[] | select(.shape == \"${search_ctx#shape:}\")]" ;;
-        impacted) _jq_filter="[.data[] | select(.\"has-impacted-components\" == true)]" ;;
+        state:*)  _jq_filter="[.data.items[] | select(.\"lifecycle-state\" == \"${search_ctx#state:}\")]" ;;
+        health:*) _jq_filter="[.data.items[] | select(.health == \"${search_ctx#health:}\")]" ;;
+        shape:*)  _jq_filter="[.data.items[] | select(.shape == \"${search_ctx#shape:}\")]" ;;
+        impacted) _jq_filter="[.data.items[] | select(.\"has-impacted-components\" == true)]" ;;
     esac
 
     echo ""
@@ -55463,9 +55483,12 @@ manage_compute_hosts() {
         # v3.25.74: add K8s columns, remove platform from defaults
         if ! grep -q "^k8s" "$CHOST_COLUMNS_CONF" 2>/dev/null; then
             sed -i '/^shape$/a k8s\ncordon\ntaint\npods' "$CHOST_COLUMNS_CONF" 2>/dev/null
-            # Remove platform from enabled list (user can re-enable via col)
             sed -i '/^platform$/d' "$CHOST_COLUMNS_CONF" 2>/dev/null
         fi
+        # v3.25.99: remove instance, platform, impacted from defaults
+        sed -i '/^instance$/d' "$CHOST_COLUMNS_CONF" 2>/dev/null
+        sed -i '/^impacted$/d' "$CHOST_COLUMNS_CONF" 2>/dev/null
+        sed -i '/^platform$/d' "$CHOST_COLUMNS_CONF" 2>/dev/null
     fi
 
     while true; do
@@ -55494,10 +55517,9 @@ manage_compute_hosts() {
             fetch_compute_hosts
             _step_complete "compute hosts($(_clc "$COMPUTE_HOST_CACHE"))"
         fi
-        _step_finish
-        _display_api_refresh_status "Compute host API data"
 
         if [[ ! -f "$COMPUTE_HOST_CACHE" ]]; then
+            _step_finish
             echo -e "${RED}Failed to fetch compute host data${NC}"
             echo -e "  ${GRAY}If you expect hosts, verify IAM policy:${NC}"
             _ui_policy_hint "read compute-hosts in compartment"
@@ -55510,6 +55532,7 @@ manage_compute_hosts() {
         total_hosts=$(grep -cv "^#" "$COMPUTE_HOST_CACHE" 2>/dev/null)
 
         if [[ "${total_hosts:-0}" -eq 0 ]]; then
+            _step_finish
             local _ch_region="${FOCUS_REGION:-$REGION}"
             echo -e "${YELLOW}No dedicated compute hosts found in ${WHITE}${_ch_region}${NC}"
             echo -e "  ${GRAY}Compute hosts are region-specific. Use ${WHITE}env r${GRAY} to switch regions.${NC}"
@@ -55528,10 +55551,10 @@ manage_compute_hosts() {
         # Fetch impacted host details (individual GET calls) + build lookup
         # Format: host_ocid|maintenanceType|recycleLevel|comp1_type:comp1_action:comp1_faultId:comp1_severity;...
         #-----------------------------------------------------------------------
-        _step_init
         _ch_fetch_impacted_details
         _ch_fetch_k8s_data
         _step_finish
+        _display_api_refresh_status "Compute host API data"
 
         _CH_IMPACT_LOOKUP="${TEMP_DIR}/ch_impact_lookup_$$.txt"
         : > "$_CH_IMPACT_LOOKUP"
@@ -55734,18 +55757,29 @@ manage_compute_hosts() {
                                 _imp_mt=$(echo "$_imp_line" | cut -d'|' -f2)
                                 _imp_rl=$(echo "$_imp_line" | cut -d'|' -f3)
                                 _imp_comps=$(echo "$_imp_line" | cut -d'|' -f4)
-                                # Build compact component summary: NIC/DOWNTIME HPCRDMA-0002-03
+                                # Aggregate components by faultId: "HPCRDMA-0002-02 ×8 NIC/DOWNTIME"
                                 local _imp_detail=""
+                                declare -A _imp_agg=()
                                 IFS=';' read -ra _imp_arr <<< "$_imp_comps"
                                 for _ic in "${_imp_arr[@]}"; do
                                     [[ -z "$_ic" ]] && continue
                                     local _ic_type _ic_act _ic_fid _ic_sev
                                     IFS=':' read -r _ic_type _ic_act _ic_fid _ic_sev <<< "$_ic"
-                                    [[ -n "$_imp_detail" ]] && _imp_detail+=", "
-                                    _imp_detail+="${_ic_type}/${_ic_act} ${_ic_fid}"
+                                    local _agg_key="${_ic_fid}|${_ic_type}/${_ic_act}"
+                                    _imp_agg["$_agg_key"]=$(( ${_imp_agg["$_agg_key"]:-0} + 1 ))
                                 done
+                                for _ak in "${!_imp_agg[@]}"; do
+                                    local _ak_fid="${_ak%%|*}" _ak_label="${_ak#*|}" _ak_ct="${_imp_agg[$_ak]}"
+                                    [[ -n "$_imp_detail" ]] && _imp_detail+=", "
+                                    if [[ "$_ak_ct" -gt 1 ]]; then
+                                        _imp_detail+="${_ak_fid} ×${_ak_ct} ${_ak_label}"
+                                    else
+                                        _imp_detail+="${_ak_fid} ${_ak_label}"
+                                    fi
+                                done
+                                unset _imp_agg
                                 local _imp_suffix="maint:${_imp_mt}"
-                                [[ -n "$_imp_rl" && "$_imp_rl" != "N/A" ]] && _imp_suffix+=" | ${_imp_rl}"
+                                # recycle level omitted for brevity
                                 _himpact_flag=" ${LIGHT_RED}[Impacted: ${_imp_detail} ${_imp_suffix}]${NC}"
                             else
                                 _himpact_flag=" ${LIGHT_RED}[Impacted]${NC}"
@@ -55806,12 +55840,136 @@ manage_compute_hosts() {
         done < <(grep -v "^#" "$COMPUTE_HOST_CACHE" | cut -d'|' -f4 | sort | uniq -c | sort -rn)
         echo ""
 
-        # Has Impacted hosts
+        # Impacted host count (used by menu option 5)
         local impacted_count
         impacted_count=$(grep -v "^#" "$COMPUTE_HOST_CACHE" | awk -F'|' '$16 == "true"' | wc -l)
-        if [[ "$impacted_count" -gt 0 ]]; then
-            echo -e "  ${BOLD}${RED}Impacted:${NC}   ${RED}${impacted_count} host(s) with impacted components${NC}"
+
+        # GPU Memory Fabric — tabular per-fabric summary
+        local _fab_count
+        _fab_count=$(grep -v "^#" "$COMPUTE_HOST_CACHE" | awk -F'|' '$15 != "" && $15 != "N/A" { print $15 }' | sort -u | wc -l)
+        if [[ "$_fab_count" -gt 0 ]]; then
+            echo ""
+            _ui_subheader "GPU Memory Fabrics (${_fab_count})" 0
+            echo ""
+
+            # Build per-fabric data: fabricOCID|shape|hosts|occupied|available|impacted|ad
+            local _fab_data_file="${TEMP_DIR}/ch_fab_summary_$$.txt"
+            grep -v "^#" "$COMPUTE_HOST_CACHE" | awk -F'|' '
+                $15 != "" && $15 != "N/A" {
+                    fab = $15; shape = $4; state = $2; imp = $16; ad = $6
+                    fab_shape[fab] = shape
+                    # Store short AD — extract AD-N suffix
+                    if (match(ad, /AD-[0-9]+/))
+                        fab_ad[fab] = substr(ad, RSTART, RLENGTH)
+                    else
+                        fab_ad[fab] = ad
+                    fab_total[fab]++
+                    if (state == "OCCUPIED") fab_occ[fab]++
+                    if (state == "AVAILABLE") fab_avl[fab]++
+                    if (imp == "true") fab_imp[fab]++
+                }
+                END {
+                    for (f in fab_shape) {
+                        print f "|" fab_shape[f] "|" fab_total[f] "|" (fab_occ[f]+0) "|" (fab_avl[f]+0) "|" (fab_imp[f]+0) "|" fab_ad[f]
+                    }
+                }' | sort -t'|' -k2,2 -k7,7 -k1,1 > "$_fab_data_file"
+
+            # Build host→fabric impacted component map
+            declare -A _fab_imp_detail=()
+            if [[ -s "${_CH_IMPACT_LOOKUP:-}" ]]; then
+                # Single awk pass: join cache (host→fabric) with impact lookup
+                while IFS='|' read -r _fid_fab _fid_summary; do
+                    _fab_imp_detail["$_fid_fab"]="$_fid_summary"
+                done < <(awk -F'|' '
+                    NR == FNR {
+                        if ($9 != "" && $9 != "N/A" && $15 != "" && $15 != "N/A")
+                            fab[$9] = $15
+                        next
+                    }
+                    {
+                        host = $1; mt = $2; comps = $4
+                        f = fab[host]
+                        if (f == "") next
+                        n = split(comps, arr, ";")
+                        for (i = 1; i <= n; i++) {
+                            split(arr[i], c, ":")
+                            ctype = c[1]; cact = c[2]; cfid = c[3]
+                            if (cfid != "" && cfid != "?") {
+                                key = f SUBSEP mt SUBSEP cfid SUBSEP ctype "/" cact
+                                count[key] += 1
+                            }
+                        }
+                    }
+                    END {
+                        # Group by fabric
+                        for (k in count) {
+                            split(k, p, SUBSEP)
+                            f = p[1]; mt = p[2]; fid = p[3]; label = p[4]; ct = count[k]
+                            detail[f] = detail[f] mt ":" fid ":" ct ":" label ";"
+                        }
+                        for (f in detail) print f "|" detail[f]
+                    }' <(grep -v "^#" "$COMPUTE_HOST_CACHE") "$_CH_IMPACT_LOOKUP")
+            fi
+
+            # Table header
+            printf "  ${BOLD}${WHITE}%-14s %-22s %4s %6s %6s %6s %6s  %-s${NC}\n" \
+                "Fabric" "Shape" "AD" "Hosts" "InUse" "Avail" "Imp" "Impact Details"
+            printf "  ${GRAY}%-14s %-22s %4s %6s %6s %6s %6s  %-s${NC}\n" \
+                "--------------" "----------------------" "----" "------" "------" "------" "------" "-----------------------------"
+
+            local _fab_total_inuse=0 _fab_total_avail=0 _fab_total_imp=0 _fab_total_all=0 _fab_imp_fab_ct=0
+            while IFS='|' read -r _fl_ocid _fl_shape _fl_total _fl_occ _fl_avl _fl_imp _fl_ad; do
+                local _fl_short="${_fl_ocid: -5}"
+
+                # Color for available/impacted columns
+                local _fl_avl_c="${CYAN}" _fl_imp_c="${GRAY}" _fl_occ_c="${GREEN}"
+                [[ "$_fl_avl" -eq 0 ]] && _fl_avl_c="${GRAY}"
+                [[ "$_fl_imp" -gt 0 ]] && _fl_imp_c="${RED}" && (( _fab_imp_fab_ct++ ))
+
+                # Build compact impact detail string for this fabric
+                local _fl_detail="-"
+                if [[ "$_fl_imp" -gt 0 && -n "${_fab_imp_detail[$_fl_ocid]:-}" ]]; then
+                    _fl_detail=""
+                    IFS=';' read -ra _fl_parts <<< "${_fab_imp_detail[$_fl_ocid]}"
+                    for _flp in "${_fl_parts[@]}"; do
+                        [[ -z "$_flp" ]] && continue
+                        local _flp_mt _flp_fid _flp_ct _flp_label
+                        IFS=':' read -r _flp_mt _flp_fid _flp_ct _flp_label <<< "$_flp"
+                        [[ -n "$_fl_detail" ]] && _fl_detail+=", "
+                        if [[ "$_flp_ct" -gt 1 ]]; then
+                            _fl_detail+="${_flp_fid} x${_flp_ct} ${_flp_label} (${_flp_mt})"
+                        else
+                            _fl_detail+="${_flp_fid} ${_flp_label} (${_flp_mt})"
+                        fi
+                    done
+                fi
+
+                # Row color for impact detail
+                local _fl_det_c="${GRAY}"
+                [[ "$_fl_detail" == *TERMINATE* ]] && _fl_det_c="${RED}"
+                [[ "$_fl_detail" == *DOWNTIME* ]] && _fl_det_c="${YELLOW}"
+
+                printf "  ${MAGENTA}%-14s${NC} ${WHITE}%-22s${NC} ${GRAY}%4s${NC} %6s ${_fl_occ_c}%6s${NC} ${_fl_avl_c}%6s${NC} ${_fl_imp_c}%6s${NC}  ${_fl_det_c}%s${NC}\n" \
+                    "fabric-${_fl_short}" "$_fl_shape" "$_fl_ad" "$_fl_total" "$_fl_occ" "$_fl_avl" "$_fl_imp" "$_fl_detail"
+
+                (( _fab_total_inuse += _fl_occ ))
+                (( _fab_total_avail += _fl_avl ))
+                (( _fab_total_imp += _fl_imp ))
+                (( _fab_total_all += _fl_total ))
+            done < "$_fab_data_file"
+            rm -f "$_fab_data_file" 2>/dev/null
+
+            # Totals row
+            printf "  ${GRAY}%-14s %-22s %4s %6s %6s %6s %6s${NC}\n" \
+                "--------------" "----------------------" "----" "------" "------" "------" "------"
+            local _ft_imp_c="${GRAY}"
+            [[ "$_fab_total_imp" -gt 0 ]] && _ft_imp_c="${RED}"
+            printf "  ${BOLD}${WHITE}%-14s %-22s %4s${NC} ${WHITE}%6s${NC} ${GREEN}%6s${NC} ${CYAN}%6s${NC} ${_ft_imp_c}%6s${NC}" \
+                "" "Total" "" "$_fab_total_all" "$_fab_total_inuse" "$_fab_total_avail" "$_fab_total_imp"
+            [[ "$_fab_imp_fab_ct" -gt 0 ]] && printf "  ${RED}%s of %s fabrics impacted${NC}" "$_fab_imp_fab_ct" "$_fab_count"
+            echo ""
         fi
+        echo ""
 
         echo -e "  ${WHITE}Total Hosts:${NC} ${GREEN}$total_hosts${NC}"
         echo ""
@@ -56145,12 +56303,80 @@ compute_host_view_impacted() {
     while IFS='|' read -r display_name state health shape platform ad fd inst_id host_ocid _hpc _netblk _locblk _hostgrp _capres _gpufab has_impacted _rest; do
         [[ -z "$display_name" ]] && continue
         ((_ch_idx++))
+        # Build per-row impacted component inline suffix
+        local _pri_suffix=""
+        if [[ "$has_impacted" == "true" && -s "${_CH_IMPACT_LOOKUP:-}" ]]; then
+            local _pri_line
+            _pri_line=$(grep "^${host_ocid}|" "$_CH_IMPACT_LOOKUP" 2>/dev/null | head -1)
+            if [[ -n "$_pri_line" ]]; then
+                local _pri_mt _pri_comps _pri_detail=""
+                _pri_mt=$(echo "$_pri_line" | cut -d'|' -f2)
+                _pri_comps=$(echo "$_pri_line" | cut -d'|' -f4)
+                declare -A _pri_agg=()
+                IFS=';' read -ra _pri_arr <<< "$_pri_comps"
+                for _pc in "${_pri_arr[@]}"; do
+                    [[ -z "$_pc" ]] && continue
+                    local _pc_type _pc_act _pc_fid _pc_sev
+                    IFS=':' read -r _pc_type _pc_act _pc_fid _pc_sev <<< "$_pc"
+                    local _pc_key="${_pc_fid}|${_pc_type}/${_pc_act}"
+                    _pri_agg["$_pc_key"]=$(( ${_pri_agg["$_pc_key"]:-0} + 1 ))
+                done
+                for _pk in "${!_pri_agg[@]}"; do
+                    local _pk_fid="${_pk%%|*}" _pk_label="${_pk#*|}" _pk_ct="${_pri_agg[$_pk]}"
+                    [[ -n "$_pri_detail" ]] && _pri_detail+=", "
+                    if [[ "$_pk_ct" -gt 1 ]]; then
+                        _pri_detail+="${_pk_fid} ×${_pk_ct} ${_pk_label}"
+                    else
+                        _pri_detail+="${_pk_fid} ${_pk_label}"
+                    fi
+                done
+                unset _pri_agg
+                if [[ -n "$_pri_detail" ]]; then
+                    local _pri_mc="${YELLOW}"
+                    [[ "$_pri_mt" == *REPLACE* ]] && _pri_mc="${RED}"
+                    _pri_suffix=" ${_pri_mc}${_pri_mt}: ${_pri_detail}${NC}"
+                fi
+            fi
+        fi
+
+        # Set row suffix so it prints on same line after columns
+        _COL_ROW_SUFFIX="$_pri_suffix"
         _ch_print_host_row "$_ch_idx" "$display_name" "$state" "$health" "$shape" \
             "$platform" "$ad" "$fd" "$inst_id" "$host_ocid" "$has_impacted" "$_gpufab"
     done < "$_filtered_file"
     rm -f "$_filtered_file" 2>/dev/null
 
     _ch_hidden_cols_notice
+
+    # Impacted component summary — aggregated faultCode × maint × component count
+    if [[ -s "${_CH_IMPACT_LOOKUP:-}" ]]; then
+        echo ""
+        _ui_subheader "Impacted Component Summary" 0
+        echo ""
+        printf "  ${BOLD}${WHITE}%-24s %-30s %s${NC}\n" "Maintenance" "Fault Code" "Components"
+        print_separator 70
+        while IFS='|' read -r _is_mtype _is_fault _is_comp_ct; do
+            local _is_mc="${WHITE}"
+            [[ "$_is_mtype" == *REPLACE* ]] && _is_mc="${RED}"
+            [[ "$_is_mtype" == *MIGRATE* ]] && _is_mc="${YELLOW}"
+            [[ "$_is_mtype" == *DOWNTIME* ]] && _is_mc="${YELLOW}"
+            printf "  ${_is_mc}%-24s${NC} ${CYAN}%-30s${NC} ${WHITE}%s${NC}\n" "$_is_mtype" "$_is_fault" "$_is_comp_ct"
+        done < <(awk -F'|' '{
+            mt = $2; comps = $4
+            n = split(comps, arr, ";")
+            for (i = 1; i <= n; i++) {
+                split(arr[i], c, ":")
+                fid = c[3]
+                if (fid != "" && fid != "?") {
+                    key = mt "|" fid
+                    count[key] += 1
+                }
+            }
+        } END {
+            for (k in count) print k "|" count[k]
+        }' "$_CH_IMPACT_LOOKUP" | sort -t'|' -k1,1 -k2,2)
+    fi
+
     _ch_post_table_actions "Impacted View" "impacted"
 }
 
