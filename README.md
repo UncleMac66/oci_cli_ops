@@ -1,6 +1,6 @@
 **OCI CLI Operations** — Interactive management tool for Oracle Cloud Infrastructure, Kubernetes, and GPU infrastructure.
 
-**Version:** 3.25.73 | **Date:** 2026-03-04
+**Version:** 3.27.2 | **Date:** 2026-03-11
 
 ## Overview
 
@@ -356,6 +356,8 @@ Focus can be saved to `variables.sh` via `env` → `s` (save). The current focus
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 3.27.2 | 2026-03-11 | o3 summary: monthly fault code/fabric tables with lifecycle columns, fault code reference with component/description/impact. c10 summary: per-fabric GPU memory table, per-row impacted inline, skip k8s without context |
+| 3.26.0 | 2026-03-10 | Dedicated pool GB200 fix, capacity report error diagnostics, `h#` compute host navigation from o3, RDMA alignment, c10 impacted component aggregation |
 | 3.25.73 | 2026-03-04 | Compute host impacted component details via `compute-host get`, recycle-details, `h#` detail drill-down, parallel detail fetch with progress |
 | 3.25.66 | 2026-03-02 | Compute host RDMA tree: topology counts, fabric tags, aligned OCIDs |
 | 3.25.56 | 2026-03-02 | Audit logs: column visibility system, request action column, search drill-down |
@@ -405,10 +407,10 @@ Sample terminal output for key management screens. All data is sanitized — no 
   ├── HPC Island          [2 nb, 6 lb, 48 hosts       ]  [ocid1.hpcisland.oc1.phx...a1b2c3]
   │   ├── Network Block   [3 lb, 24 hosts              ]  [ocid1.computenetworkblock...d4e5f6]
   │   │   ├── Local Block [8 hosts                     ]  [ocid1.computelocalblock...g7h8i9]
-  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...j0k1l2]  ✓ worker-01
-  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...m3n4o5]  ✓ worker-02
-  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [DEGRADED ]  [ocid1.computehost...p6q7r8]  ✓ worker-03  [Impacted: NIC/DOWNTIME HPCRDMA-0002 | FULL_RECYCLE]
-  │   │   │   └── BM.GPU.H100.8 [fabric-ab12c]  [ACTIVE  ] [OK       ]  [ocid1.computehost...s9t0u1]  ✓ worker-04
+  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [OCCUPIED ] [HEALTHY  ]  [ocid1.computehost...j0k1l2]  ✓ instance
+  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [OCCUPIED ] [HEALTHY  ]  [ocid1.computehost...m3n4o5]  ✓ instance
+  │   │   │   ├── BM.GPU.H100.8 [fabric-ab12c]  [OCCUPIED ] [DEGRADED ]  [ocid1.computehost...p6q7r8]  ✓ instance  [Impacted: HPCRDMA-0002-02 ×8 NIC/DOWNTIME maint:DOWNTIME]
+  │   │   │   └── BM.GPU.H100.8 [fabric-ab12c]  [OCCUPIED ] [HEALTHY  ]  [ocid1.computehost...s9t0u1]  ✓ instance
   │   │   ├── Local Block [8 hosts                     ]  [ocid1.computelocalblock...v2w3x4]
   │   │   │   └── ...
   │   │   └── Local Block [8 hosts                     ]  [ocid1.computelocalblock...y5z6a7]
@@ -418,7 +420,23 @@ Sample terminal output for key management screens. All data is sanitized — no 
   └── HPC Island          [1 nb, 3 lb, 24 hosts       ]  [ocid1.hpcisland.oc1.phx...e1f2g3]
       └── ...
 
-  By State:   ACTIVE(46) INACTIVE(2)     By Health:  OK(44) DEGRADED(3) UNHEALTHY(1)
+  ◆ Summary
+  By State:   OCCUPIED(46) AVAILABLE(2)     By Health:  HEALTHY(44) DEGRADED(3) UNHEALTHY(1)
+  By Shape:   BM.GPU.H100.8(48)
+
+  ◆ GPU Memory Fabrics (6)
+
+  Fabric         Shape                   AD  Hosts  InUse  Avail    Imp  Impact Details
+  -------------- ---------------------- ---- ------ ------ ------ ------  -----------------------------
+  fabric-ab12c   BM.GPU.H100.8          AD-1      8      8      0      1  HPCRDMA-0002-02 x8 NIC/DOWNTIME (DOWNTIME)
+  fabric-cd34e   BM.GPU.H100.8          AD-1      8      8      0      0  -
+  fabric-ef56g   BM.GPU.H100.8          AD-1      8      8      0      0  -
+  fabric-gh78i   BM.GPU.H100.8          AD-2      8      8      0      0  -
+  fabric-ij90k   BM.GPU.H100.8          AD-2      8      6      2      0  -
+  fabric-kl12m   BM.GPU.H100.8          AD-2      8      8      0      0  -
+  -------------- ---------------------- ---- ------ ------ ------ ------
+                 Total                            48     46      2      1  1 of 6 fabrics impacted
+
   Total Hosts: 48
 ```
 
@@ -637,26 +655,69 @@ Sample terminal output for key management screens. All data is sanitized — no 
 ### Maintenance Events (`--manage o,3`)
 
 ```
-  ══════════════════════════════════════════════════════════════════════════════════════════════════
-  INSTANCES REQUIRING MAINTENANCE ATTENTION
-  Showing instances with: unhealthy compute host health state
-  ══════════════════════════════════════════════════════════════════════════════════════════════════
-  ID  Display Name              OCI State  K8s Node            Ready  Cordon Pods  CompHost  Serial        Shape              Instance OCID
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  1   gpu-worker-node-03        RUNNING    gpu-worker-03       False  false    0   ch-ab12   SN-A1B2C3D4   BM.GPU.H100.8      ocid1.instance...x1y2z3
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-
-                                                                                                 Current UTC: 2026-03-02T14:33:01Z
-  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   #   Instance Name             K8s Node            Serial        State     K8s    Crdn  Taints  Pods  Maint Reason          Lifecycle   Event Name                 Window Start
   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   1   gpu-worker-node-03        gpu-worker-03       SN-A1B2C3D4   RUNNING   Ready  false none      0   HARDWARE_FAILURE      SCHEDULED   LIVE_MIGRATION             2026-03-10T08:00:00
-  2   gpu-worker-node-07        gpu-worker-07       SN-X7Y8Z9A0   RUNNING   Ready  true  maint     7   PLANNED_MAINTENANCE   ONGOING     REBOOT_MIGRATION           2026-03-02T12:00:00
+  2   gpu-worker-node-07        gpu-worker-07       SN-X7Y8Z9A0   RUNNING   Ready  true  maint     7   PLANNED_MAINTENANCE   SUCCEEDED   REBOOT_MIGRATION           2026-02-15T12:00:00
+  3   gpu-worker-node-12        gpu-worker-12       SN-D5E6F7G8   RUNNING   Ready  false none     14   HARDWARE_FAILURE      SCHEDULED   LIVE_MIGRATION             2026-03-12T06:00:00
   ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Hidden: category announce fault_code comp_host — use 'col' to toggle
 
-  m# event detail  m#,r reschedule  view toggle  col columns  r refresh
-  [Maintenance Events] m#, view, col, r, q >
+  ◆ Summary
+
+  Total: 62 maintenance event(s)
+
+  By Fault Code:
+  Month     Fault Code               Nodes   SCHED    PASS  CANCEL    FAIL
+  --------- ---------------------- ------ ------- ------- ------- -------
+  Feb 2026  HPCRDMA-0002-02            38      20      12       5       1
+            SMARTNIC-8000-17            3       -       -       3       -
+            SPNVDA-XID149-0400          1       -       -       1       -
+  Mar 2026  HPCRDMA-0002-02            14      12       -       2       -
+            HPCRDMA-0002-03             4       3       -       1       -
+            HPCRDMA-0002-04             1       1       -       -       -
+            SMARTNIC-8000-17            1       1       -       -       -
+  --------- ---------------------- ------ ------- ------- ------- -------
+  Totals by Fault Code:
+            HPCRDMA-0002-02            52      32      12       7       1
+            HPCRDMA-0002-03             4       3       -       1       -
+            HPCRDMA-0002-04             1       1       -       -       -
+            SMARTNIC-8000-17            4       1       -       3       -
+            SPNVDA-XID149-0400          1       -       -       1       -
+  --------- ---------------------- ------ ------- ------- ------- -------
+            Total                      62      37      12      12       1
+
+  Fault Code Reference:
+  ──────────────────────────────────────────────────────────────────────────────────
+  HPCRDMA-0002-02 [HPC_NIC]
+    Description:  A network component requires maintenance to prevent degraded performance
+    Impact:       Host may experience brief network interruption during maintenance window
+  ──────────────────────────────────────────────────────────────────────────────────
+  SMARTNIC-8000-17 [SMART_NIC]
+    Description:  SmartNIC firmware update required for security patch
+    Impact:       Network throughput may be reduced during update
+  ──────────────────────────────────────────────────────────────────────────────────
+
+  By GPU Fabric:
+  Month     Fabric           Fault Code            Nodes   SCHED    PASS  CANCEL    FAIL
+  --------- ---------------- -------------------- ------ ------- ------- ------- -------
+  Feb 2026  fabric-x1y2z     HPCRDMA-0002-02           8       4       4       -       -
+  Mar 2026  fabric-a3b4c     HPCRDMA-0002-03           1       1       -       -       -
+            fabric-x1y2z     HPCRDMA-0002-02           4       5       -       -       -
+                             SMARTNIC-8000-17          1       -       -       -       -
+            fabric-d5e6f     HPCRDMA-0002-02          14      14       -       -       -
+            fabric-g7h8i     HPCRDMA-0002-02           1       1       -       -       -
+  --------- ---------------- -------------------- ------ ------- ------- ------- -------
+  Totals by Fabric/Fault Code:
+            fabric-a3b4c     HPCRDMA-0002-03           1       1       -       -       -
+            fabric-x1y2z     HPCRDMA-0002-02          12       9       4       -       -
+                             SMARTNIC-8000-17          1       -       -       -       -
+            fabric-d5e6f     HPCRDMA-0002-02          14      14       -       -       -
+            fabric-g7h8i     HPCRDMA-0002-02           1       1       -       -       -
+  --------- ---------------- -------------------- ------ ------- ------- ------- -------
+                             Total                    29      25       4       0       0  4 fabric(s)
+
+  m# event detail  h# host detail  m#,r reschedule  view toggle  col columns  r refresh
+  [Maintenance Events] m#, h#, view, col, r, q >
 ```
 
 ---
