@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.26.8"
+readonly SCRIPT_VERSION="3.26.9"
 readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9685,6 +9685,7 @@ list_maintenance_events() {
     declare -A _me_fault_lc_counts=()
     declare -A _me_cluster_counts=()
     declare -A _me_cluster_fault_counts=()
+    declare -A _me_cf_lc_counts=()
     declare -A _me_cluster_lc_counts=()
     local me_idx=0
 
@@ -9929,6 +9930,7 @@ list_maintenance_events() {
             [[ "$_cf_fault" == "-" ]] && _cf_fault="(no fault code)"
             local _cf_compound="${inst_gpu_cluster_name}|${_cf_fault}"
             ((_me_cluster_fault_counts[$_cf_compound]=${_me_cluster_fault_counts[$_cf_compound]:-0}+1))
+            ((_me_cf_lc_counts["${inst_gpu_cluster_name}|${_cf_fault}|${_lc}"]=${_me_cf_lc_counts["${inst_gpu_cluster_name}|${_cf_fault}|${_lc}"]:-0}+1))
         fi
 
         if [[ "$me_view_mode" == "detail" ]]; then
@@ -10017,65 +10019,88 @@ list_maintenance_events() {
     if [[ ${#_me_fault_counts[@]} -gt 0 ]]; then
         echo ""
         echo -e "  ${BOLD}${WHITE}By Fault Code:${NC}"
-        printf "  ${BOLD}${WHITE}%-26s %6s  %-s${NC}\n" "Fault Code" "Nodes" "Lifecycle"
-        printf "  ${GRAY}%-26s %6s  %-s${NC}\n" "--------------------------" "------" "-----------------------------"
+        printf "  ${BOLD}${WHITE}%-22s %6s %7s %7s %7s %7s${NC}\n" "Fault Code" "Nodes" "SCHED" "PASS" "CANCEL" "FAIL"
+        printf "  ${GRAY}%-22s %6s %7s %7s %7s %7s${NC}\n" "----------------------" "------" "-------" "-------" "-------" "-------"
+        local _fc_total=0 _fc_t_sched=0 _fc_t_pass=0 _fc_t_cancel=0 _fc_t_fail=0
         local _fc_key
         while IFS= read -r _fc_key; do
             [[ -z "$_fc_key" ]] && continue
-            local _fl_parts=""
-            local _fl_key
-            while IFS= read -r _fl_key; do
-                [[ -z "$_fl_key" ]] && continue
-                local _fl_fc="${_fl_key%%|*}" _fl_lc="${_fl_key#*|}"
-                [[ "$_fl_fc" != "$_fc_key" ]] && continue
-                local _fl_lc_c="${GRAY}"
-                case "$_fl_lc" in
-                    SCHEDULED) _fl_lc_c="${YELLOW}" ;;
-                    SUCCEEDED) _fl_lc_c="${GREEN}" ;;
-                    CANCELED)  _fl_lc_c="${GRAY}" ;;
-                    FAILED)    _fl_lc_c="${RED}" ;;
-                esac
-                _fl_parts="${_fl_parts} ${_fl_lc_c}${_fl_lc}:${_me_fault_lc_counts[$_fl_key]}${NC}"
-            done < <(printf '%s\n' "${!_me_fault_lc_counts[@]}" | sort)
-            printf "  ${CYAN}%-26s${NC} ${WHITE}%6d${NC}  ${GRAY}(${NC}%b ${GRAY})${NC}\n" "$_fc_key" "${_me_fault_counts[$_fc_key]}" "$_fl_parts"
+            local _fc_n="${_me_fault_counts[$_fc_key]}"
+            local _fc_s="${_me_fault_lc_counts["${_fc_key}|SCHEDULED"]:-0}"
+            local _fc_p="${_me_fault_lc_counts["${_fc_key}|SUCCEEDED"]:-0}"
+            local _fc_c="${_me_fault_lc_counts["${_fc_key}|CANCELED"]:-0}"
+            local _fc_f="${_me_fault_lc_counts["${_fc_key}|FAILED"]:-0}"
+            # Color: non-zero gets color, zero gets gray dash
+            local _sc="${GRAY}" _pc="${GRAY}" _cc="${GRAY}" _fcc="${GRAY}"
+            local _sv="-" _pv="-" _cv="-" _fv="-"
+            [[ "$_fc_s" -gt 0 ]] && _sc="${YELLOW}" _sv="$_fc_s"
+            [[ "$_fc_p" -gt 0 ]] && _pc="${GREEN}" _pv="$_fc_p"
+            [[ "$_fc_c" -gt 0 ]] && _cc="${GRAY}" _cv="$_fc_c"
+            [[ "$_fc_f" -gt 0 ]] && _fcc="${RED}" _fv="$_fc_f"
+            printf "  ${CYAN}%-22s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
+                "$_fc_key" "$_fc_n" "$_sv" "$_pv" "$_cv" "$_fv"
+            (( _fc_total += _fc_n )); (( _fc_t_sched += _fc_s )); (( _fc_t_pass += _fc_p ))
+            (( _fc_t_cancel += _fc_c )); (( _fc_t_fail += _fc_f ))
         done < <(printf '%s\n' "${!_me_fault_counts[@]}" | sort)
+        printf "  ${GRAY}%-22s %6s %7s %7s %7s %7s${NC}\n" "----------------------" "------" "-------" "-------" "-------" "-------"
+        local _ts="${GRAY}" _tp="${GRAY}" _tc="${GRAY}" _tf="${GRAY}"
+        local _tsv="-" _tpv="-" _tcv="-" _tfv="-"
+        [[ "$_fc_t_sched" -gt 0 ]] && _ts="${YELLOW}" _tsv="$_fc_t_sched"
+        [[ "$_fc_t_pass" -gt 0 ]] && _tp="${GREEN}" _tpv="$_fc_t_pass"
+        [[ "$_fc_t_cancel" -gt 0 ]] && _tc="${GRAY}" _tcv="$_fc_t_cancel"
+        [[ "$_fc_t_fail" -gt 0 ]] && _tf="${RED}" _tfv="$_fc_t_fail"
+        printf "  ${BOLD}${WHITE}%-22s %6d${NC} ${_ts}%7s${NC} ${_tp}%7s${NC} ${_tc}%7s${NC} ${_tf}%7s${NC}\n" \
+            "Total" "$_fc_total" "$_tsv" "$_tpv" "$_tcv" "$_tfv"
     fi
 
-    # Summary by GPU memory cluster with fault code + lifecycle breakdown
+    # Unified table: GPU Fabric → Fault Code with lifecycle columns
     if [[ ${#_me_cluster_counts[@]} -gt 0 ]]; then
         echo ""
         echo -e "  ${BOLD}${WHITE}By GPU Fabric:${NC}"
-        printf "  ${BOLD}${WHITE}%-26s %6s  %-s${NC}\n" "Fabric" "Nodes" "Lifecycle"
-        printf "  ${GRAY}%-26s %6s  %-s${NC}\n" "--------------------------" "------" "-----------------------------"
+        printf "  ${BOLD}${WHITE}%-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "Fabric" "Fault Code" "Nodes" "SCHED" "PASS" "CANCEL" "FAIL"
+        printf "  ${GRAY}%-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------------" "--------------------" "------" "-------" "-------" "-------" "-------"
+        local _gt_nodes=0 _gt_sched=0 _gt_pass=0 _gt_cancel=0 _gt_fail=0 _gt_fabs=0
         local _gc_key
         while IFS= read -r _gc_key; do
             [[ -z "$_gc_key" ]] && continue
-            local _cl_parts=""
-            local _cl_key
-            while IFS= read -r _cl_key; do
-                [[ -z "$_cl_key" ]] && continue
-                local _cl_gc="${_cl_key%%|*}" _cl_lc="${_cl_key#*|}"
-                [[ "$_cl_gc" != "$_gc_key" ]] && continue
-                local _cl_lc_c="${GRAY}"
-                case "$_cl_lc" in
-                    SCHEDULED) _cl_lc_c="${YELLOW}" ;;
-                    SUCCEEDED) _cl_lc_c="${GREEN}" ;;
-                    CANCELED)  _cl_lc_c="${GRAY}" ;;
-                    FAILED)    _cl_lc_c="${RED}" ;;
-                esac
-                _cl_parts="${_cl_parts} ${_cl_lc_c}${_cl_lc}:${_me_cluster_lc_counts[$_cl_key]}${NC}"
-            done < <(printf '%s\n' "${!_me_cluster_lc_counts[@]}" | sort)
-            printf "  ${MAGENTA}%-26s${NC} ${WHITE}%6d${NC}  ${GRAY}(${NC}%b ${GRAY})${NC}\n" "$_gc_key" "${_me_cluster_counts[$_gc_key]}" "$_cl_parts"
-            # Sub-lines: fault codes within this cluster
+            (( _gt_fabs++ ))
+            local _first_row=true
             local _cf_key
             while IFS= read -r _cf_key; do
                 [[ -z "$_cf_key" ]] && continue
-                local _cf_cluster="${_cf_key%%|*}"
-                local _cf_fault="${_cf_key#*|}"
+                local _cf_cluster="${_cf_key%%|*}" _cf_fault="${_cf_key#*|}"
                 [[ "$_cf_cluster" != "$_gc_key" ]] && continue
-                printf "    ${GRAY}↳${NC} ${YELLOW}%-22s${NC} ${WHITE}%6d${NC}\n" "$_cf_fault" "${_me_cluster_fault_counts[$_cf_key]}"
+                local _cf_n="${_me_cluster_fault_counts[$_cf_key]}"
+                local _cf_s="${_me_cf_lc_counts["${_gc_key}|${_cf_fault}|SCHEDULED"]:-0}"
+                local _cf_p="${_me_cf_lc_counts["${_gc_key}|${_cf_fault}|SUCCEEDED"]:-0}"
+                local _cf_c="${_me_cf_lc_counts["${_gc_key}|${_cf_fault}|CANCELED"]:-0}"
+                local _cf_f="${_me_cf_lc_counts["${_gc_key}|${_cf_fault}|FAILED"]:-0}"
+                local _sc="${GRAY}" _pc="${GRAY}" _cc="${GRAY}" _fcc="${GRAY}"
+                local _sv="-" _pv="-" _cv="-" _fv="-"
+                [[ "$_cf_s" -gt 0 ]] && _sc="${YELLOW}" _sv="$_cf_s"
+                [[ "$_cf_p" -gt 0 ]] && _pc="${GREEN}" _pv="$_cf_p"
+                [[ "$_cf_c" -gt 0 ]] && _cc="${GRAY}" _cv="$_cf_c"
+                [[ "$_cf_f" -gt 0 ]] && _fcc="${RED}" _fv="$_cf_f"
+                local _fab_label=""
+                if [[ "$_first_row" == true ]]; then
+                    _fab_label="$_gc_key"
+                    _first_row=false
+                fi
+                printf "  ${MAGENTA}%-16s${NC} ${CYAN}%-20s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
+                    "$_fab_label" "$_cf_fault" "$_cf_n" "$_sv" "$_pv" "$_cv" "$_fv"
+                (( _gt_nodes += _cf_n )); (( _gt_sched += _cf_s )); (( _gt_pass += _cf_p ))
+                (( _gt_cancel += _cf_c )); (( _gt_fail += _cf_f ))
             done < <(printf '%s\n' "${!_me_cluster_fault_counts[@]}" | sort)
         done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
+        printf "  ${GRAY}%-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------------" "--------------------" "------" "-------" "-------" "-------" "-------"
+        local _gts="${GRAY}" _gtp="${GRAY}" _gtc="${GRAY}" _gtf="${GRAY}"
+        local _gtsv="-" _gtpv="-" _gtcv="-" _gtfv="-"
+        [[ "$_gt_sched" -gt 0 ]] && _gts="${YELLOW}" _gtsv="$_gt_sched"
+        [[ "$_gt_pass" -gt 0 ]] && _gtp="${GREEN}" _gtpv="$_gt_pass"
+        [[ "$_gt_cancel" -gt 0 ]] && _gtc="${GRAY}" _gtcv="$_gt_cancel"
+        [[ "$_gt_fail" -gt 0 ]] && _gtf="${RED}" _gtfv="$_gt_fail"
+        printf "  ${BOLD}${WHITE}%-16s %-20s %6d${NC} ${_gts}%7s${NC} ${_gtp}%7s${NC} ${_gtc}%7s${NC} ${_gtf}%7s${NC}  ${GRAY}%s fabric(s)${NC}\n" \
+            "" "Total" "$_gt_nodes" "$_gtsv" "$_gtpv" "$_gtcv" "$_gtfv" "$_gt_fabs"
     fi
 
     # Count tainted nodes for hint in menu
