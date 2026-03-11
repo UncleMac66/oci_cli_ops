@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.27.1"
+readonly SCRIPT_VERSION="3.27.2"
 readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9693,6 +9693,7 @@ list_maintenance_events() {
     declare -A _me_month_cf_counts=()             # "month|cluster|fault" → count
     declare -A _me_month_cf_lc_counts=()          # "month|cluster|fault|lifecycle" → count
     declare -A _me_months=()                      # unique months
+    declare -A _me_fault_desc=()                  # "faultCode" → "component~description~impact"
     local me_idx=0
 
     while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_time_finished evt_time_created evt_additional; do
@@ -9920,6 +9921,10 @@ list_maintenance_events() {
             local rf_fault_id rf_component rf_severity rf_desc rf_impact rf_recommended
             IFS='~' read -r rf_fault_id rf_component rf_severity rf_desc rf_impact rf_recommended <<< "$row_fault"
             [[ "$rf_fault_id" != "-" && -n "$rf_fault_id" ]] && compact_fault_code="$rf_fault_id"
+            # Store component/description/impact per fault code (first seen wins)
+            if [[ "$compact_fault_code" != "-" && -z "${_me_fault_desc[$compact_fault_code]:-}" ]]; then
+                _me_fault_desc["$compact_fault_code"]="${rf_component:-}~${rf_desc:-}~${rf_impact:-}"
+            fi
         fi
 
         # Accumulate summary counters
@@ -10118,6 +10123,26 @@ list_maintenance_events() {
         _me_lc_fmt "$_fc_t_f" F; local _tf="$_lf_c" _tfv="$_lf_v"
         printf "  ${BOLD}${WHITE}%-10s %-22s %6d${NC} ${_ts}%7s${NC} ${_tp}%7s${NC} ${_tc}%7s${NC} ${_tf}%7s${NC}\n" \
             "" "Total" "$_fc_total" "$_tsv" "$_tpv" "$_tcv" "$_tfv"
+
+        # Fault Code Reference — description and impact per fault code
+        if [[ ${#_me_fault_desc[@]} -gt 0 ]]; then
+            echo ""
+            echo -e "  ${BOLD}${WHITE}Fault Code Reference:${NC}"
+            local _fr_sep="──────────────────────────────────────────────────────────────────────────────────"
+            echo -e "  ${GRAY}${_fr_sep}${NC}"
+            local _fr_key
+            while IFS= read -r _fr_key; do
+                [[ -z "$_fr_key" ]] && continue
+                local _fr_comp _fr_desc _fr_impact
+                IFS='~' read -r _fr_comp _fr_desc _fr_impact <<< "${_me_fault_desc[$_fr_key]}"
+                local _fr_comp_tag=""
+                [[ -n "$_fr_comp" && "$_fr_comp" != "-" ]] && _fr_comp_tag=" ${GRAY}[${WHITE}${_fr_comp}${GRAY}]${NC}"
+                echo -e "  ${CYAN}${_fr_key}${NC}${_fr_comp_tag}"
+                [[ -n "$_fr_desc" && "$_fr_desc" != "-" ]] && printf "    ${WHITE}Description:${NC}  ${GRAY}%s${NC}\n" "${_fr_desc:0:240}"
+                [[ -n "$_fr_impact" && "$_fr_impact" != "-" ]] && printf "    ${WHITE}Impact:${NC}       ${GRAY}%s${NC}\n" "${_fr_impact:0:240}"
+                echo -e "  ${GRAY}${_fr_sep}${NC}"
+            done < <(printf '%s\n' "${!_me_fault_desc[@]}" | sort)
+        fi
     fi
 
     # ── By GPU Fabric (grouped by month) ──
