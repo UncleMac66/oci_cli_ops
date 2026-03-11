@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.27.0"
+readonly SCRIPT_VERSION="3.27.1"
 readonly SCRIPT_VERSION_DATE="2026-03-10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9695,7 +9695,7 @@ list_maintenance_events() {
     declare -A _me_months=()                      # unique months
     local me_idx=0
 
-    while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_time_finished evt_additional; do
+    while IFS='|' read -r evt_id evt_instance_id evt_reason evt_category evt_lifecycle evt_window_start evt_hard_due evt_can_resched evt_display_name evt_instance_action evt_time_finished evt_time_created evt_additional; do
         [[ -z "$evt_id" ]] && continue
         
         # Skip events not in filtered set (filter already applied in filter pass)
@@ -9924,9 +9924,9 @@ list_maintenance_events() {
 
         # Accumulate summary counters
         local _lc="${evt_lifecycle:-N/A}"
-        # Derive month label from evt_window_start (format: 2026-03-10T...)
+        # Derive month label from evt_time_created (format: 2026-03-10T...)
         local _evt_month="Unknown"
-        if [[ "$evt_window_start" =~ ^([0-9]{4})-([0-9]{2}) ]]; then
+        if [[ "$evt_time_created" =~ ^([0-9]{4})-([0-9]{2}) ]]; then
             local _ey="${BASH_REMATCH[1]}" _em="${BASH_REMATCH[2]}"
             case "$_em" in
                 01) _evt_month="Jan ${_ey}" ;; 02) _evt_month="Feb ${_ey}" ;;
@@ -10033,7 +10033,7 @@ list_maintenance_events() {
             _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$fault_code_color" "$cap_topo_color" "$GRAY" "$GRAY" "$CYAN"
         fi
             
-    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
+    done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["time-created"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
     
     echo ""
     _ui_subheader "Summary" 0
