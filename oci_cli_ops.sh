@@ -430,8 +430,8 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.27.2"
-readonly SCRIPT_VERSION_DATE="2026-03-10"
+readonly SCRIPT_VERSION="3.28.0"
+readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
 ( umask 077 && mkdir -p "$CACHE_DIR" 2>/dev/null )
@@ -1791,8 +1791,8 @@ fetch_gpu_fabrics() {
     # Write cache header and data - filter out DELETED/TERMINATED, deduplicate
     {
         echo "# GPU Memory Fabrics"
-        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState"
-        jq -r '.data.items[] | select(.["lifecycle-state"] != "DELETED" and .["lifecycle-state"] != "TERMINATED") | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["healthy-host-count"] // 0)|\(.["available-host-count"] // 0)|\(.["total-host-count"] // 0)|\(.["current-firmware-bundle-id"] // "N/A")|\(.["target-firmware-bundle-id"] // "N/A")|\(.["firmware-update-state"] // "N/A")"' "$raw_json" 2>/dev/null | sort -u
+        echo "# Format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState|TimeCreated"
+        jq -r '.data.items[] | select(.["lifecycle-state"] != "DELETED" and .["lifecycle-state"] != "TERMINATED") | "\(.["display-name"])|\(.id[-5:] | ascii_downcase)|\(.id)|\(.["lifecycle-state"])|\(.["healthy-host-count"] // 0)|\(.["available-host-count"] // 0)|\(.["total-host-count"] // 0)|\(.["current-firmware-bundle-id"] // "N/A")|\(.["target-firmware-bundle-id"] // "N/A")|\(.["firmware-update-state"] // "N/A")|\(.["time-created"] // "N/A")"' "$raw_json" 2>/dev/null | sort -u
     } | _cache_write "$FABRIC_CACHE"
 
     # Save raw JSON for JSON viewer
@@ -1842,7 +1842,7 @@ fetch_gpu_clusters() {
     # Write cache headers
     {
         echo "# GPU Memory Clusters"
-        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId|Size"
+        echo "# Format: ClusterOCID|DisplayName|State|FabricSuffix|InstanceConfigurationId|ComputeClusterId|Size|TimeCreated"
     } | _cache_write "$CLUSTER_CACHE"
 
     {
@@ -1909,7 +1909,7 @@ fetch_gpu_clusters() {
                      else
                         (($name | capture("fabric-(?<suffix>[a-z0-9]{5})") // {suffix: ""}).suffix)
                      end) as $fabric_suffix |
-                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($fabric_suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")|\(.data["size"] // 0)",
+                    "\(.data.id)|\($name)|\(.data["lifecycle-state"])|\($fabric_suffix)|\(.data["instance-configuration-id"] // "N/A")|\(.data["compute-cluster-id"] // "N/A")|\(.data["size"] // 0)|\(.data["time-created"] // "N/A")",
                     ($name // "N/A")
                 ' <<< "$cluster_json" 2>/dev/null)
                 # First line is cache record, second is display name
@@ -2476,7 +2476,7 @@ fetch_compute_clusters() {
     # Write cache header
     {
         echo "# Compute Clusters"
-        echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain|LifecycleState"
+        echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain|LifecycleState|TimeCreated"
     } | _cache_write "$COMPUTE_CLUSTER_CACHE"
     
     # Get availability domains
@@ -2500,7 +2500,7 @@ fetch_compute_clusters() {
                 --output json > "$raw_json" 2>/dev/null; then
 
             # OCI returns .data.items[] for paginated results
-            jq -r '(.data.items // .data // [])[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
+            jq -r '(.data.items // .data // [])[] | "\(.id)|\(.["display-name"] // "N/A")|\(.["availability-domain"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")|\(.["time-created"] // "N/A")"' "$raw_json" >> "$COMPUTE_CLUSTER_CACHE" 2>/dev/null
             # Collect JSON files for merge
             _cc_json_parts+=("$raw_json")
         else
@@ -5108,6 +5108,28 @@ color_firmware_state() {
         FAILED|ERROR) echo "$RED" ;;
         *) echo "$WHITE" ;;
     esac
+}
+
+# Calculate days since a given ISO timestamp, return "(Xd)" string
+# Args: $1 = ISO timestamp (e.g., 2026-01-13T18:30:00.000Z)
+# Returns: "(Xd)" or "(-)" if invalid
+_days_since() {
+    local ts="${1:-}"
+    [[ -z "$ts" || "$ts" == "N/A" || "$ts" == "null" ]] && { echo "(-)"; return; }
+    local epoch_then epoch_now
+    epoch_then=$(date -d "${ts}" +%s 2>/dev/null) || { echo "(-)"; return; }
+    epoch_now=$(date +%s)
+    local days=$(( (epoch_now - epoch_then) / 86400 ))
+    echo "(${days}d)"
+}
+
+# Extract YYYY-MM-DD from an ISO timestamp
+# Args: $1 = ISO timestamp
+# Returns: "YYYY-MM-DD" or "N/A" if invalid
+_date_short() {
+    local ts="${1:-}"
+    [[ -z "$ts" || "$ts" == "N/A" || "$ts" == "null" ]] && { echo "N/A"; return; }
+    echo "${ts:0:10}"
 }
 
 #===============================================================================
@@ -12001,7 +12023,7 @@ display_clique_summary() {
         # Get fabric info
         local fabric_info fabric_name fabric_ocid healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state
         fabric_info=$(get_fabric_from_cluster "$gpu_cluster_ocid")
-        IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state <<< "$fabric_info"
+        IFS='|' read -r fabric_name _ fabric_ocid _ healthy_hosts available_hosts total_hosts current_firmware target_firmware firmware_update_state _ <<< "$fabric_info"
         
         # Count instances in this cluster
         local cluster_entries total_instances in_k8s_count not_in_k8s_count
@@ -12226,7 +12248,7 @@ display_clique_summary() {
         
         # Find fabrics not referenced by any cluster
         # FABRIC_CACHE format: DisplayName|Last5Chars|FabricOCID|State|HealthyHosts|AvailableHosts|TotalHosts|CurrentFirmware|TargetFirmware|FirmwareUpdateState
-        while IFS='|' read -r fabric_name last5 fabric_ocid fabric_state healthy avail total current_fw target_fw fw_state; do
+        while IFS='|' read -r fabric_name last5 fabric_ocid fabric_state healthy avail total current_fw target_fw fw_state _; do
             [[ "$fabric_name" =~ ^#.*$ ]] && continue
             [[ -z "$fabric_ocid" ]] && continue
             
@@ -13123,10 +13145,11 @@ display_gpu_management_menu() {
     printf "  ${GRAY}f# = GPU Memory Fabric   g# = GPU Memory Cluster${NC}\n"
     echo ""
 
-    # Header for fabrics - aligned columns (no firmware)
-    printf "${BOLD}%-5s %-45s %-12s %8s %6s%6s  %s${NC}\n" \
-        "ID" "Display Name" "State" "Healthy" "Avail" "Total" "OCID"
-    print_separator 158
+    # Header for fabrics — widened columns with Created/Age
+    # Col positions: ID(0-4) Name(6-65) State(68-79) Created(81-90) Age(92-97) Healthy Avail Total OCID
+    printf "${BOLD}%-5s %-60s  %-12s %-10s %-6s %7s %5s %5s  %s${NC}\n" \
+        "ID" "Display Name" "State" "Created" "(Age)" "Healthy" "Avail" "Total" "OCID"
+    print_separator 160
     
     local fabric_idx=0
     local cluster_idx=0
@@ -13137,7 +13160,7 @@ display_gpu_management_menu() {
         local sorted_fabrics
         sorted_fabrics=$(grep -v '^#' "$FABRIC_CACHE" 2>/dev/null | sort -t'|' -k1,1f)
         
-        while IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_fw target_fw fw_state; do
+        while IFS='|' read -r fabric_name fabric_suffix fabric_ocid fabric_state healthy_hosts avail_hosts total_hosts current_fw target_fw fw_state fabric_created; do
             [[ -z "$fabric_ocid" ]] && continue
             
             ((fabric_idx++))
@@ -13163,42 +13186,57 @@ display_gpu_management_menu() {
             local avail_color="$WHITE"
             [[ "$avail_hosts" != "0" && "$avail_hosts" != "N/A" ]] && avail_color="$LIGHT_GREEN"
             
-            # Print fabric line: main info with OCID on same line
-            printf "${YELLOW}%-5s${NC} ${CYAN}%-45s${NC} ${state_color}%-12s${NC} ${WHITE}%8s${NC} ${avail_color}%6s${NC}${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
-                "$fid" "$fabric_name" "$fabric_state" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_ocid"
+            # Compute created date and age for fabric
+            local _fab_date _fab_age
+            _fab_date=$(_date_short "${fabric_created:-}")
+            _fab_age=$(_days_since "${fabric_created:-}")
 
-            # ── Firmware line (fabric-level, shown once above clusters) ──
-            local _fw_cur_short="N/A" _fw_tar_short="N/A" _fw_update_badge="" _fw_state_color=""
+            # Print fabric line: main info with Created/Age and OCID on same line
+            printf "${YELLOW}%-5s${NC} ${CYAN}%-60s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%7s${NC} ${avail_color}%5s${NC} ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
+                "$fid" "$fabric_name" "$fabric_state" "$_fab_date" "$_fab_age" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_ocid"
+
+            # ── Firmware line (fabric-level, with [STATUS] badge, cur:/tgt: aligned to State/Created cols) ──
+            local _fw_cur_short="N/A" _fw_tar_short="N/A"
             if [[ "$current_fw" != "N/A" && -n "$current_fw" ]]; then
                 _fw_cur_short="..${current_fw: -4}"
             fi
             if [[ "$target_fw" != "N/A" && -n "$target_fw" ]]; then
                 _fw_tar_short="..${target_fw: -4}"
             fi
+            # Badge color: green for no update, red for needs update
+            local _fw_badge_text="[${fw_state:-N/A}]"
+            local _fw_badge_color="$WHITE"
+            case "${fw_state:-}" in
+                NO_UPDATE|UP_TO_DATE|COMPLETED) _fw_badge_color="$GREEN" ;;
+                NEEDS_UPDATE|IN_PROGRESS|UPDATING) _fw_badge_color="$RED" ;;
+            esac
+            # Color target firmware red if it differs from current
+            local _fw_tar_color="$YELLOW"
             if [[ "$current_fw" != "N/A" && "$target_fw" != "N/A" && -n "$current_fw" && -n "$target_fw" && "$current_fw" != "$target_fw" ]]; then
-                _fw_update_badge="${RED}[WILL UPDATE]${NC}"
-            else
-                _fw_update_badge="${GREEN}[NO UPDATE]${NC}"
+                _fw_tar_color="$RED"
             fi
-            _fw_state_color=$(color_firmware_state "$fw_state")
-            # Aligned: cur: under State(52), tgt: under Avail(74), badge under OCID(88)
-            # Layout: 5+1(│)+3(pad)+4(%-4s)+1(sp)+10("Firmware: ")+27(%-27s)+1(sp) = 52
-            printf "     ${WHITE}│${NC}   %-4s ${GRAY}Firmware: ${_fw_state_color}%-27s${NC} ${YELLOW}%-12s${NC} %8s ${YELLOW}%-12s${NC}  %b\n" \
-                "" "${fw_state:-N/A}" "cur:$_fw_cur_short" "" "tgt:$_fw_tar_short" "$_fw_update_badge"
+            # Firmware: [BADGE] then pad to col 68 for cur:, col 81 for tgt:
+            # "     ├─ " = 8, "Firmware: " = 10, badge = variable → pad remaining to col 68
+            local _fw_label="Firmware: ${_fw_badge_text}"
+            local _fw_prefix_len=$(( 8 + ${#_fw_label} ))
+            local _fw_pad=$(( 68 - _fw_prefix_len ))
+            [[ $_fw_pad -lt 1 ]] && _fw_pad=1
+            printf "     ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
 
             # Find and display clusters for this fabric
             local clusters_found=0
             if [[ -f "$CLUSTER_CACHE" ]]; then
                 # Collect clusters for this fabric (include ACTIVE, UPDATING, SCALING, CREATING states)
                 local cluster_lines=()
-                while IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size; do
+                while IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size cluster_created; do
                     [[ "$cluster_ocid" =~ ^#.*$ ]] && continue
                     [[ -z "$cluster_ocid" ]] && continue
                     # Skip terminated/deleted clusters
                     [[ "$cluster_state" == "DELETED" ]] && continue
                     [[ "$cluster_fabric_suffix" != "$fabric_suffix" ]] && continue
 
-                    cluster_lines+=("$cluster_ocid|$cluster_name|$cluster_state|$cluster_fabric_suffix|$instance_config_id|$compute_cluster_id|$cluster_size")
+                    cluster_lines+=("$cluster_ocid|$cluster_name|$cluster_state|$cluster_fabric_suffix|$instance_config_id|$compute_cluster_id|$cluster_size|${cluster_created:-N/A}")
                 done < <(grep -v '^#' "$CLUSTER_CACHE" 2>/dev/null)
 
                 local num_clusters=${#cluster_lines[@]}
@@ -13210,8 +13248,8 @@ display_gpu_management_menu() {
                     ((cluster_idx++))
                     ((clusters_found++))
 
-                    local cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size
-                    IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size <<< "$cluster_line"
+                    local cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size cluster_created
+                    IFS='|' read -r cluster_ocid cluster_name cluster_state cluster_fabric_suffix instance_config_id compute_cluster_id cluster_size cluster_created <<< "$cluster_line"
 
                     # Accumulate provisioned nodes
                     [[ "$cluster_size" =~ ^[0-9]+$ ]] && ((summary_cluster_nodes += cluster_size))
@@ -13236,15 +13274,59 @@ display_gpu_management_menu() {
                     local state_color
                     state_color=$(color_cluster_state "$cluster_state")
 
-                    # Cluster line 1: ID, Name, State (aligned), Size (aligned with Total), OCID on same line
-                    printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-37s${NC} ${state_color}%-12s${NC} %8s %6s${WHITE}%6s${NC}  ${YELLOW}%s${NC}\n" \
-                        "$gid" "$cluster_name" "$cluster_state" "" "" "$cluster_size" "$cluster_ocid"
+                    # Compute created date and age for cluster
+                    local _cl_date _cl_age
+                    _cl_date=$(_date_short "${cluster_created:-}")
+                    _cl_age=$(_days_since "${cluster_created:-}")
 
-                    # Cluster detail: Compute Cluster
-                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Compute Cluster: ${BLUE}%s${NC}\n" "$cc_name"
+                    # Cluster line: ID, Name, State, Created, Age, Size, OCID
+                    # 5(indent)+3(tree)+1(sp)+4(gid)+1(sp)+52(name)+2(gap) = 68 → State col
+                    printf "     ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-52s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} %7s %5s ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
+                        "$gid" "$cluster_name" "$cluster_state" "$_cl_date" "$_cl_age" "" "" "$cluster_size" "$cluster_ocid"
 
-                    # Cluster detail: Instance Configuration (full name)
-                    printf "     ${WHITE}${continuation}${NC}            ${GRAY}Instance Config: ${GREEN}%s${NC}\n" "$ic_name"
+                    # Get compute cluster state and created date from cache
+                    local _cc_state="" _cc_created=""
+                    if [[ "$compute_cluster_id" != "N/A" && -n "$compute_cluster_id" && -f "$COMPUTE_CLUSTER_CACHE" ]]; then
+                        local _cc_line
+                        _cc_line=$(grep "^${compute_cluster_id}|" "$COMPUTE_CLUSTER_CACHE" 2>/dev/null | head -n1)
+                        if [[ -n "$_cc_line" ]]; then
+                            IFS='|' read -r _ _ _ _cc_state _cc_created <<< "$_cc_line"
+                        fi
+                    fi
+                    local _cc_date _cc_age _cc_state_color
+                    _cc_date=$(_date_short "${_cc_created:-}")
+                    _cc_age=$(_days_since "${_cc_created:-}")
+                    _cc_state_color=$(color_resource_state "${_cc_state:-}")
+
+                    # Get instance config created date from cache
+                    local _ic_created=""
+                    if [[ "$instance_config_id" != "N/A" && -n "$instance_config_id" && -f "$INSTANCE_CONFIG_CACHE" ]]; then
+                        local _ic_line
+                        _ic_line=$(grep "^${instance_config_id}|" "$INSTANCE_CONFIG_CACHE" 2>/dev/null | head -n1)
+                        if [[ -n "$_ic_line" ]]; then
+                            IFS='|' read -r _ _ _ic_created <<< "$_ic_line"
+                        fi
+                    fi
+                    local _ic_date _ic_age
+                    _ic_date=$(_date_short "${_ic_created:-}")
+                    _ic_age=$(_days_since "${_ic_created:-}")
+
+                    # Sub-tree indent: use continuation char for multi-cluster, spaces for last
+                    local _sub_pfx
+                    if [[ "$continuation" == "│" ]]; then
+                        _sub_pfx="     ${WHITE}│${NC}         "
+                    else
+                        _sub_pfx="              "
+                    fi
+
+                    # Cluster detail: Compute Cluster with tree, State, Created, Age
+                    # 14(indent)+3(├─ )+18(label)+31(name)+2(gap) = 68 → State col
+                    printf "${_sub_pfx}${WHITE}├─${NC} ${GRAY}%-18s${NC}${BLUE}%-31s${NC}  ${_cc_state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
+                        "Compute Cluster: " "${cc_name:0:31}" "${_cc_state:-}" "$_cc_date" "$_cc_age"
+
+                    # Cluster detail: Instance Config with tree, Created, Age (no state)
+                    printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%-31s${NC}  %-12s ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
+                        "Instance Config: " "${ic_name:0:31}" "" "$_ic_date" "$_ic_age"
                 done
             fi
 
@@ -13261,9 +13343,9 @@ display_gpu_management_menu() {
     
     # ── Summary ──
     if [[ $fabric_idx -gt 0 ]]; then
-        print_separator 158
-        printf "${BOLD}%-5s %-45s %-12s %8s %6s%6s${NC}\n" \
-            "" "Summary (${fabric_idx} fabrics)" "" "$summary_healthy" "$summary_avail" "$summary_total"
+        print_separator 160
+        printf "${BOLD}%-5s %-60s  %-12s %10s %6s %7s %5s %5s${NC}\n" \
+            "" "Summary (${fabric_idx} fabrics)" "" "" "" "$summary_healthy" "$summary_avail" "$summary_total"
         printf "%-5s ${GRAY}GPU Memory Clusters: ${WHITE}${summary_clusters}${GRAY}   Cluster Nodes Provisioned: ${WHITE}${summary_cluster_nodes}${NC}\n" ""
     fi
     echo ""
@@ -13271,20 +13353,25 @@ display_gpu_management_menu() {
     # ========== INSTANCE CONFIGURATIONS ==========
     _ui_subheader "Instance Configurations" 0
     echo ""
-    _ui_table_header "%-5s %-60s %-98s" "ID" "Instance Configuration Name" "OCID"
-    
+    printf "${BOLD}%-5s %-60s  %-10s %-6s  %s${NC}\n" "ID" "Instance Configuration Name" "Created" "(Age)" "OCID"
+    print_separator 160
+
     local ic_idx=0
     if [[ -f "$INSTANCE_CONFIG_CACHE" ]]; then
-        while IFS='|' read -r ic_ocid ic_name _; do
+        while IFS='|' read -r ic_ocid ic_name ic_created; do
             [[ "$ic_ocid" =~ ^#.*$ ]] && continue
             [[ -z "$ic_ocid" ]] && continue
-            
+
             ((ic_idx++))
             local iid="i${ic_idx}"
             IC_INDEX_MAP[$iid]="$ic_ocid"
-            
-            printf "${YELLOW}%-5s${NC} ${WHITE}%-60s${NC} ${YELLOW}%-98s${NC}\n" \
-                "$iid" "$ic_name" "$ic_ocid"
+
+            local _ic_dt _ic_ag
+            _ic_dt=$(_date_short "${ic_created:-}")
+            _ic_ag=$(_days_since "${ic_created:-}")
+
+            printf "${YELLOW}%-5s${NC} ${WHITE}%-60s${NC}  ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}  ${YELLOW}%s${NC}\n" \
+                "$iid" "$ic_name" "$_ic_dt" "$_ic_ag" "$ic_ocid"
         done < <(grep -v '^#' "$INSTANCE_CONFIG_CACHE" 2>/dev/null)
     fi
     
@@ -13294,30 +13381,35 @@ display_gpu_management_menu() {
     # ========== COMPUTE CLUSTERS ==========
     _ui_subheader "Compute Clusters" 0
     echo ""
-    _ui_table_header "%-5s %-50s %-12s %s" "ID" "Compute Cluster Name" "Status" "OCID"
-    
+    printf "${BOLD}%-5s %-50s  %-12s %-10s %-6s  %s${NC}\n" "ID" "Compute Cluster Name" "Status" "Created" "(Age)" "OCID"
+    print_separator 160
+
     local cc_idx=0
     if [[ -f "$COMPUTE_CLUSTER_CACHE" ]]; then
-        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
+        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state cc_created; do
             [[ "$cc_ocid" =~ ^#.*$ ]] && continue
             [[ -z "$cc_ocid" ]] && continue
-            
+
             # Default state if not present (old cache format)
             [[ -z "$cc_state" ]] && cc_state="UNKNOWN"
-            
+
             # Skip deleted clusters
             [[ "$cc_state" == "DELETED" ]] && continue
-            
+
             ((cc_idx++))
             local cid="c${cc_idx}"
             CC_INDEX_MAP[$cid]="$cc_ocid"
-            
+
             # Color-code the status
             local state_color
             state_color=$(color_resource_state "$cc_state")
-            
-            printf "${YELLOW}%-5s${NC} ${WHITE}%-50s${NC} ${state_color}%-12s${NC} ${CYAN}%s${NC}\n" \
-                "$cid" "$cc_name" "$cc_state" "$cc_ocid"
+
+            local _cc_dt _cc_ag
+            _cc_dt=$(_date_short "${cc_created:-}")
+            _cc_ag=$(_days_since "${cc_created:-}")
+
+            printf "${YELLOW}%-5s${NC} ${WHITE}%-50s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}  ${CYAN}%s${NC}\n" \
+                "$cid" "$cc_name" "$cc_state" "$_cc_dt" "$_cc_ag" "$cc_ocid"
         done < <(grep -v '^#' "$COMPUTE_CLUSTER_CACHE" 2>/dev/null)
     fi
     
@@ -43636,7 +43728,7 @@ manage_compute_clusters() {
         if [[ -f "$COMPUTE_CLUSTER_CACHE" ]] && [[ -s "$COMPUTE_CLUSTER_CACHE" ]]; then
             printf "  ${GRAY}%-4s %-45s %-35s %-12s${NC}\n" "#" "Display Name" "Availability Domain" "Status"
             echo -e "  ${GRAY}──────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-            while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
+            while IFS='|' read -r cc_ocid cc_name cc_ad cc_state _; do
                 [[ -z "$cc_ocid" || "$cc_ocid" == "#"* ]] && continue
                 
                 # Default state if not present (old cache format)
@@ -43847,7 +43939,7 @@ delete_compute_cluster_interactive() {
         echo ""
         printf "  ${GRAY}%-4s %-45s %-35s %-12s${NC}\n" "#" "Display Name" "Availability Domain" "Status"
         echo -e "  ${GRAY}──────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state; do
+        while IFS='|' read -r cc_ocid cc_name cc_ad cc_state _; do
             [[ -z "$cc_ocid" || "$cc_ocid" == "#"* ]] && continue
 
             # Default state if not present (old cache format)
