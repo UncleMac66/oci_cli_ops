@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.29.0"
+readonly SCRIPT_VERSION="3.29.1"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13107,6 +13107,11 @@ list_instances_by_gpu_cluster() {
 # GPU MEMORY FABRIC & CLUSTER MANAGEMENT
 #===============================================================================
 
+# Toggle flags for c4 sub-line visibility (persist across redraws)
+declare -g _C4_SHOW_FW="${_C4_SHOW_FW:-true}"    # Firmware line
+declare -g _C4_SHOW_CC="${_C4_SHOW_CC:-true}"     # Compute Cluster sub-line
+declare -g _C4_SHOW_IC="${_C4_SHOW_IC:-true}"     # Instance Config sub-line
+
 # Display interactive management menu
 display_gpu_management_menu() {
     local compartment_id="${FOCUS_COMPARTMENT_ID:-$COMPARTMENT_ID}"
@@ -13191,6 +13196,14 @@ display_gpu_management_menu() {
     _ui_subheader "GPU Memory Fabrics & Clusters" 0
     echo ""
     printf "  ${GRAY}f# = GPU Memory Fabric   g# = GPU Memory Cluster${NC}\n"
+    # Show hidden sub-lines notice (only when something is toggled off)
+    local _hidden_parts=""
+    [[ "$_C4_SHOW_FW" != "true" ]] && _hidden_parts+="firmware "
+    [[ "$_C4_SHOW_CC" != "true" ]] && _hidden_parts+="compute-cluster "
+    [[ "$_C4_SHOW_IC" != "true" ]] && _hidden_parts+="instance-config "
+    if [[ -n "$_hidden_parts" ]]; then
+        echo -e "  ${GRAY}Hidden: ${_hidden_parts}— use ${NC}toggle${GRAY} to restore${NC}"
+    fi
     echo ""
 
     # Header for fabrics — widened columns with Created/Age
@@ -13249,40 +13262,44 @@ display_gpu_management_menu() {
             printf "${YELLOW}%-5s${NC} ${CYAN}%-60s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%7s${NC} ${avail_color}%5s${NC} ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
                 "$fid" "$fabric_name" "$fabric_state" "$_fab_date" "$_fab_age" "$healthy_hosts" "$avail_hosts" "$total_hosts" "$fabric_ocid"
 
-            # ── Firmware line (fabric-level, with [STATUS] badge, cur:/tgt: aligned to State/Created cols) ──
-            local _fw_cur_short="N/A" _fw_tar_short="N/A"
-            if [[ "$current_fw" != "N/A" && -n "$current_fw" ]]; then
-                _fw_cur_short="..${current_fw: -4}"
+            # ── Firmware line (toggleable via _C4_SHOW_FW) ──
+            if [[ "$_C4_SHOW_FW" == "true" ]]; then
+                local _fw_cur_short="N/A" _fw_tar_short="N/A"
+                if [[ "$current_fw" != "N/A" && -n "$current_fw" ]]; then
+                    _fw_cur_short="..${current_fw: -4}"
+                fi
+                if [[ "$target_fw" != "N/A" && -n "$target_fw" ]]; then
+                    _fw_tar_short="..${target_fw: -4}"
+                fi
+                # Badge color: green for no update, red for needs update
+                local _fw_badge_text="[${fw_state:-N/A}]"
+                local _fw_badge_color="$WHITE"
+                case "${fw_state:-}" in
+                    NO_UPDATE|UP_TO_DATE|COMPLETED) _fw_badge_color="$GREEN" ;;
+                    NEEDS_UPDATE|IN_PROGRESS|UPDATING) _fw_badge_color="$RED" ;;
+                esac
+                # Color target firmware red if it differs from current
+                local _fw_tar_color="$YELLOW"
+                if [[ "$current_fw" != "N/A" && "$target_fw" != "N/A" && -n "$current_fw" && -n "$target_fw" && "$current_fw" != "$target_fw" ]]; then
+                    _fw_tar_color="$RED"
+                fi
+                # Check for firmware upgrade available (uses pre-computed latest bundle)
+                local _fw_upgrade=""
+                if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
+                    _fw_upgrade=" ${CYAN}↑${NC}"
+                fi
+                # Firmware: [BADGE] ↑ then pad to col 68 for cur:, col 81 for tgt:
+                # "     ├─ " = 8, "Firmware: " = 10, badge = variable, " ↑" = 2 if upgrade → pad remaining to col 68
+                local _fw_label="Firmware: ${_fw_badge_text}"
+                local _fw_prefix_len=$(( 8 + ${#_fw_label} ))
+                [[ -n "$_fw_upgrade" ]] && ((_fw_prefix_len += 2))
+                local _fw_pad=$(( 68 - _fw_prefix_len ))
+                [[ $_fw_pad -lt 1 ]] && _fw_pad=1
+                # Use └─ if firmware is last sub-line (no clusters will follow)
+                local _fw_tree="├─"
+                printf "     ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                    "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
             fi
-            if [[ "$target_fw" != "N/A" && -n "$target_fw" ]]; then
-                _fw_tar_short="..${target_fw: -4}"
-            fi
-            # Badge color: green for no update, red for needs update
-            local _fw_badge_text="[${fw_state:-N/A}]"
-            local _fw_badge_color="$WHITE"
-            case "${fw_state:-}" in
-                NO_UPDATE|UP_TO_DATE|COMPLETED) _fw_badge_color="$GREEN" ;;
-                NEEDS_UPDATE|IN_PROGRESS|UPDATING) _fw_badge_color="$RED" ;;
-            esac
-            # Color target firmware red if it differs from current
-            local _fw_tar_color="$YELLOW"
-            if [[ "$current_fw" != "N/A" && "$target_fw" != "N/A" && -n "$current_fw" && -n "$target_fw" && "$current_fw" != "$target_fw" ]]; then
-                _fw_tar_color="$RED"
-            fi
-            # Check for firmware upgrade available (uses pre-computed latest bundle)
-            local _fw_upgrade=""
-            if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
-                _fw_upgrade=" ${CYAN}↑${NC}"
-            fi
-            # Firmware: [BADGE] ↑ then pad to col 68 for cur:, col 81 for tgt:
-            # "     ├─ " = 8, "Firmware: " = 10, badge = variable, " ↑" = 2 if upgrade → pad remaining to col 68
-            local _fw_label="Firmware: ${_fw_badge_text}"
-            local _fw_prefix_len=$(( 8 + ${#_fw_label} ))
-            [[ -n "$_fw_upgrade" ]] && ((_fw_prefix_len += 2))
-            local _fw_pad=$(( 68 - _fw_prefix_len ))
-            [[ $_fw_pad -lt 1 ]] && _fw_pad=1
-            printf "     ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
-                "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
 
             # Find and display clusters for this fabric
             local clusters_found=0
@@ -13379,14 +13396,19 @@ display_gpu_management_menu() {
                         _sub_pfx="              "
                     fi
 
-                    # Cluster detail: Compute Cluster with tree, State, Created, Age
-                    # 14(indent)+3(├─ )+18(label)+31(name)+2(gap) = 68 → State col
-                    printf "${_sub_pfx}${WHITE}├─${NC} ${GRAY}%-18s${NC}${BLUE}%-31s${NC}  ${_cc_state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
-                        "Compute Cluster: " "${cc_name:0:31}" "${_cc_state:-}" "$_cc_date" "$_cc_age"
+                    # Cluster detail sub-lines (toggleable via _C4_SHOW_CC / _C4_SHOW_IC)
+                    if [[ "$_C4_SHOW_CC" == "true" ]]; then
+                        # Use └─ if instance config is hidden (this is the last sub-line)
+                        local _cc_tree="├─"
+                        [[ "$_C4_SHOW_IC" != "true" ]] && _cc_tree="└─"
+                        printf "${_sub_pfx}${WHITE}${_cc_tree}${NC} ${GRAY}%-18s${NC}${BLUE}%-31s${NC}  ${_cc_state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
+                            "Compute Cluster: " "${cc_name:0:31}" "${_cc_state:-}" "$_cc_date" "$_cc_age"
+                    fi
 
-                    # Cluster detail: Instance Config with tree, Created, Age (no state)
-                    printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%-31s${NC}  %-12s ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
-                        "Instance Config: " "${ic_name:0:31}" "" "$_ic_date" "$_ic_age"
+                    if [[ "$_C4_SHOW_IC" == "true" ]]; then
+                        printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%-31s${NC}  %-12s ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
+                            "Instance Config: " "${ic_name:0:31}" "" "$_ic_date" "$_ic_age"
+                    fi
                 done
             fi
 
@@ -41341,6 +41363,7 @@ interactive_gpu_management() {
         echo -e "  ${GREEN}update${NC}      - Update an existing GPU Memory Cluster (size/instance config)"
         echo -e "  ${RED}d${NC}           - Delete GPU Memory Cluster(s) (e.g., 'd g1', 'd g1,g2', 'd g1-g3')"
         echo -e "  ${CYAN}fw${NC}          - Firmware Bundles (list available firmware by platform)"
+        echo -e "  ${CYAN}toggle${NC}      - Toggle sub-line visibility (firmware, compute cluster, instance config)"
         echo -e "  ${YELLOW}j${NC}           - View raw JSON (j <keyword> to search)"
         echo -e "  ${MAGENTA}r${NC}           - Refresh data from OCI"
         echo -e "  ${CYAN}back${NC}        - Return to main menu"
@@ -41348,7 +41371,7 @@ interactive_gpu_management() {
 
         # Inner loop: stay at prompt without redrawing after view actions
         while true; do
-            _ui_prompt "GPU Fabrics" "f#, g#, i#, c#, create, update, d g#, fw, j, r, back, show"
+            _ui_prompt "GPU Fabrics" "f#, g#, i#, c#, create, update, d g#, fw, toggle, j, r, back, show"
             
             local input
             read -r input
@@ -41519,6 +41542,29 @@ interactive_gpu_management() {
                     ;;
                 jg|JG)
                     [[ -s "$CLUSTER_JSON_CACHE" ]] && _ui_json_viewer "GPU Clusters" "-f" "$CLUSTER_JSON_CACHE" ".data" || echo -e "  ${GRAY}No cluster JSON cache${NC}"
+                    ;;
+                toggle|TOGGLE)
+                    echo ""
+                    local _fw_icon _cc_icon _ic_icon
+                    [[ "$_C4_SHOW_FW" == "true" ]] && _fw_icon="${GREEN}ON${NC}" || _fw_icon="${RED}OFF${NC}"
+                    [[ "$_C4_SHOW_CC" == "true" ]] && _cc_icon="${GREEN}ON${NC}" || _cc_icon="${RED}OFF${NC}"
+                    [[ "$_C4_SHOW_IC" == "true" ]] && _ic_icon="${GREEN}ON${NC}" || _ic_icon="${RED}OFF${NC}"
+                    echo -e "  ${BOLD}${WHITE}Toggle sub-line visibility:${NC}"
+                    echo -e "    ${YELLOW}1${NC}) Firmware           [${_fw_icon}]"
+                    echo -e "    ${YELLOW}2${NC}) Compute Cluster    [${_cc_icon}]"
+                    echo -e "    ${YELLOW}3${NC}) Instance Config    [${_ic_icon}]"
+                    echo -e "    ${CYAN}Enter${NC}) Cancel"
+                    echo ""
+                    echo -n -e "  ${CYAN}Toggle #: ${NC}"
+                    local _tsel
+                    read -r _tsel
+                    case "${_tsel:-}" in
+                        1) [[ "$_C4_SHOW_FW" == "true" ]] && _C4_SHOW_FW=false || _C4_SHOW_FW=true ;;
+                        2) [[ "$_C4_SHOW_CC" == "true" ]] && _C4_SHOW_CC=false || _C4_SHOW_CC=true ;;
+                        3) [[ "$_C4_SHOW_IC" == "true" ]] && _C4_SHOW_IC=false || _C4_SHOW_IC=true ;;
+                        *) continue ;;
+                    esac
+                    break  # Redraw display with new toggle state
                     ;;
                 r|R|refresh|REFRESH)
                     echo -e "${YELLOW}Refreshing cache...${NC}"
