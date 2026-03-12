@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.29.2"
+readonly SCRIPT_VERSION="3.29.3"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -41543,22 +41543,27 @@ interactive_gpu_management() {
                 jg|JG)
                     [[ -s "$CLUSTER_JSON_CACHE" ]] && _ui_json_viewer "GPU Clusters" "-f" "$CLUSTER_JSON_CACHE" ".data" || echo -e "  ${GRAY}No cluster JSON cache${NC}"
                     ;;
-                toggle|TOGGLE)
-                    echo ""
-                    local _fw_icon _cc_icon _ic_icon
-                    [[ "$_C4_SHOW_FW" == "true" ]] && _fw_icon="${GREEN}ON${NC}" || _fw_icon="${RED}OFF${NC}"
-                    [[ "$_C4_SHOW_CC" == "true" ]] && _cc_icon="${GREEN}ON${NC}" || _cc_icon="${RED}OFF${NC}"
-                    [[ "$_C4_SHOW_IC" == "true" ]] && _ic_icon="${GREEN}ON${NC}" || _ic_icon="${RED}OFF${NC}"
-                    echo -e "  ${BOLD}${WHITE}Toggle sub-line visibility:${NC}"
-                    echo -e "    ${YELLOW}1${NC}) Firmware           [${_fw_icon}]"
-                    echo -e "    ${YELLOW}2${NC}) Compute Cluster    [${_cc_icon}]"
-                    echo -e "    ${YELLOW}3${NC}) Instance Config    [${_ic_icon}]"
-                    echo -e "    ${CYAN}Enter${NC}) Cancel"
-                    echo ""
-                    echo -e "  ${GRAY}Select: 1, 2, 3, 1,3, 1-3, all${NC}"
-                    echo -n -e "  ${CYAN}Toggle #: ${NC}"
-                    local _tsel
-                    read -r _tsel
+                toggle|TOGGLE|toggle\ *|TOGGLE\ *)
+                    # Extract inline arg if provided (e.g., "toggle 1,3")
+                    local _tsel=""
+                    if [[ "$input" =~ ^[Tt][Oo][Gg][Gg][Ll][Ee][[:space:]]+(.+)$ ]]; then
+                        _tsel="${BASH_REMATCH[1]}"
+                    else
+                        echo ""
+                        local _fw_icon _cc_icon _ic_icon
+                        [[ "$_C4_SHOW_FW" == "true" ]] && _fw_icon="${GREEN}ON${NC}" || _fw_icon="${RED}OFF${NC}"
+                        [[ "$_C4_SHOW_CC" == "true" ]] && _cc_icon="${GREEN}ON${NC}" || _cc_icon="${RED}OFF${NC}"
+                        [[ "$_C4_SHOW_IC" == "true" ]] && _ic_icon="${GREEN}ON${NC}" || _ic_icon="${RED}OFF${NC}"
+                        echo -e "  ${BOLD}${WHITE}Toggle sub-line visibility:${NC}"
+                        echo -e "    ${YELLOW}1${NC}) Firmware           [${_fw_icon}]"
+                        echo -e "    ${YELLOW}2${NC}) Compute Cluster    [${_cc_icon}]"
+                        echo -e "    ${YELLOW}3${NC}) Instance Config    [${_ic_icon}]"
+                        echo -e "    ${CYAN}Enter${NC}) Cancel"
+                        echo ""
+                        echo -e "  ${GRAY}Select: 1, 2, 3, 1,3, 1-3, all${NC}"
+                        echo -n -e "  ${CYAN}Toggle #: ${NC}"
+                        read -r _tsel
+                    fi
                     [[ -z "$_tsel" ]] && continue
                     # Expand selection into individual numbers
                     local -a _tnums=()
@@ -41569,8 +41574,9 @@ interactive_gpu_management() {
                         local _tpart
                         for _tpart in ${_tsel//,/ }; do
                             if [[ "$_tpart" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                                local _ts=${BASH_REMATCH[1]} _te=${BASH_REMATCH[2]}
-                                for (( _ti=_ts; _ti<=_te; _ti++ )); do
+                                local _tstart="${BASH_REMATCH[1]}" _tend="${BASH_REMATCH[2]}"
+                                local _ti
+                                for (( _ti=_tstart; _ti<=_tend; _ti++ )); do
                                     _tnums+=("$_ti")
                                 done
                             elif [[ "$_tpart" =~ ^[0-9]+$ ]]; then
@@ -41579,6 +41585,7 @@ interactive_gpu_management() {
                         done
                     fi
                     [[ ${#_tnums[@]} -eq 0 ]] && continue
+                    local _tn
                     for _tn in "${_tnums[@]}"; do
                         case "$_tn" in
                             1) [[ "$_C4_SHOW_FW" == "true" ]] && _C4_SHOW_FW=false || _C4_SHOW_FW=true ;;
