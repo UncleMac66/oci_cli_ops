@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.28.1"
+readonly SCRIPT_VERSION="3.29.0"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -517,6 +517,7 @@ readonly IMAGE_CACHE="${CACHE_DIR}/images.txt"
 readonly CUSTOM_IMAGE_CACHE="${CACHE_DIR}/custom_images.json"
 readonly INSTANCE_CLUSTER_MAP_CACHE="${CACHE_DIR}/instance_cluster_map.txt"
 readonly INSTANCE_LIST_CACHE="${CACHE_DIR}/instance_list.json"
+readonly FW_BUNDLE_CACHE="${CACHE_DIR}/fw_bundles.json"
 
 # Network gateway cache files
 readonly VCN_LIST_CACHE="${CACHE_DIR}/vcn_list.txt"
@@ -593,6 +594,8 @@ declare -gA CACHE_TTL_MAP=(
     ["$AUDIT_EVENTS_CACHE"]=120
     # Limits search index: 24h (service limit definitions rarely change)
     ["$LIMITS_SEARCH_INDEX"]=86400
+    # Firmware bundles: 30m (bundle releases are infrequent)
+    ["$FW_BUNDLE_CACHE"]=1800
     # Everything else: default CACHE_MAX_AGE (300s/5m)
 )
 # Lookup helper — returns TTL for a cache file, defaults to CACHE_MAX_AGE
@@ -1561,6 +1564,7 @@ refresh_all_caches() {
         "$CLUSTER_NETWORK_CACHE"
         "$COMPUTE_HOST_CACHE"
         "$COMPUTE_HOST_JSON_CACHE"
+        "$FW_BUNDLE_CACHE"
         "$BOOT_VOLUME_CACHE"
         "$IMAGE_CACHE"
         "$VAULTS_CACHE"
@@ -2752,6 +2756,50 @@ fetch_compute_hosts() {
     ' <<< "$_json" >> "$COMPUTE_HOST_CACHE" 2>/dev/null
 
     return 0
+}
+
+# Fetch and cache firmware bundles for a given platform
+# Args: $1 = platform (e.g. "X9-6-GPU"), $2 = region (optional, defaults to FOCUS_REGION)
+# Cache: FW_BUNDLE_CACHE (raw JSON, 30min TTL)
+# Re-fetches if cached platform differs from requested platform
+fetch_firmware_bundles() {
+    local platform="$1"
+    local region="${2:-${FOCUS_REGION:-$REGION}}"
+
+    # Check if cache is fresh AND for the same platform
+    if is_cache_fresh "$FW_BUNDLE_CACHE"; then
+        local _cached_platform=""
+        _cached_platform=$(head -1 "$FW_BUNDLE_CACHE" 2>/dev/null | grep -oP '(?<=platform=).+' || true)
+        if [[ "$_cached_platform" == "$platform" ]]; then
+            return 0
+        fi
+    fi
+
+    local _json
+    _json=$(oci compute firmware-bundle list \
+        --platform "$platform" \
+        --compartment-id "$TENANCY_ID" \
+        --region "$region" \
+        --all --output json 2>/dev/null) || true
+
+    if [[ -z "$_json" ]]; then
+        return 1
+    fi
+
+    # Write JSON with platform tag on first line (_fw_bundle_cache_read strips it)
+    {
+        echo "// platform=${platform}"
+        echo "$_json"
+    } | _cache_write "$FW_BUNDLE_CACHE"
+
+    return 0
+}
+
+# Read firmware bundle JSON from cache (skips the platform comment line)
+# Prints the JSON to stdout; returns 1 if cache missing
+_fw_bundle_cache_read() {
+    [[ ! -f "$FW_BUNDLE_CACHE" ]] && return 1
+    tail -n +2 "$FW_BUNDLE_CACHE"
 }
 
 # Fetch and cache OKE environment information
@@ -13154,7 +13202,13 @@ display_gpu_management_menu() {
     local fabric_idx=0
     local cluster_idx=0
     local summary_healthy=0 summary_avail=0 summary_total=0 summary_clusters=0 summary_cluster_nodes=0
-    
+
+    # Pre-compute latest active firmware bundle OCID (used for upgrade indicator)
+    local _fw_latest_bundle_id=""
+    if [[ -f "$FW_BUNDLE_CACHE" ]]; then
+        _fw_latest_bundle_id=$(_fw_bundle_cache_read 2>/dev/null | jq -r '[.data.items[] | select(.["lifecycle-state"] == "ACTIVE")] | sort_by(.["display-name"]) | last | .id // ""' 2>/dev/null)
+    fi
+
     if [[ -f "$FABRIC_CACHE" ]]; then
         # Sort fabrics by display name (field 1)
         local sorted_fabrics
@@ -13215,13 +13269,19 @@ display_gpu_management_menu() {
             if [[ "$current_fw" != "N/A" && "$target_fw" != "N/A" && -n "$current_fw" && -n "$target_fw" && "$current_fw" != "$target_fw" ]]; then
                 _fw_tar_color="$RED"
             fi
-            # Firmware: [BADGE] then pad to col 68 for cur:, col 81 for tgt:
-            # "     ├─ " = 8, "Firmware: " = 10, badge = variable → pad remaining to col 68
+            # Check for firmware upgrade available (uses pre-computed latest bundle)
+            local _fw_upgrade=""
+            if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
+                _fw_upgrade=" ${CYAN}↑${NC}"
+            fi
+            # Firmware: [BADGE] ↑ then pad to col 68 for cur:, col 81 for tgt:
+            # "     ├─ " = 8, "Firmware: " = 10, badge = variable, " ↑" = 2 if upgrade → pad remaining to col 68
             local _fw_label="Firmware: ${_fw_badge_text}"
             local _fw_prefix_len=$(( 8 + ${#_fw_label} ))
+            [[ -n "$_fw_upgrade" ]] && ((_fw_prefix_len += 2))
             local _fw_pad=$(( 68 - _fw_prefix_len ))
             [[ $_fw_pad -lt 1 ]] && _fw_pad=1
-            printf "     ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+            printf "     ${WHITE}├─${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
                 "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
 
             # Find and display clusters for this fabric
@@ -41814,18 +41874,11 @@ manage_firmware_bundles() {
         done < <(grep -v "^#" "$FABRIC_CACHE")
     fi
 
-    # ── Fetch firmware bundles ──
+    # ── Fetch firmware bundles (cached, 30min TTL) ──
     echo ""
     _step_init
     _step_active "firmware bundles"
-    local _fw_json
-    _fw_json=$(oci compute firmware-bundle list \
-        --platform "$selected_platform" \
-        --compartment-id "$TENANCY_ID" \
-        --region "$region" \
-        --all --output json 2>/dev/null)
-
-    if [[ -z "$_fw_json" ]]; then
+    if ! fetch_firmware_bundles "$selected_platform" "$region"; then
         _step_complete "firmware bundles(0)"
         _step_finish
         echo -e "  ${RED}Failed to fetch firmware bundles for platform '${selected_platform}'${NC}"
@@ -41834,6 +41887,9 @@ manage_firmware_bundles() {
         _ui_pause "return"
         return
     fi
+
+    local _fw_json
+    _fw_json=$(_fw_bundle_cache_read)
 
     local _fw_count
     _fw_count=$(jq -r '.data.items | length // 0' <<< "$_fw_json" 2>/dev/null)
@@ -42043,8 +42099,8 @@ manage_firmware_bundles() {
 
     # ── Action loop ──
     while true; do
-        echo -e "  ${YELLOW}#${NC}) View bundle    ${GREEN}all${NC}) Expand all    ${GREEN}overview${NC}) Firmware overview    ${GREEN}update${NC}) Update    ${GREEN}col${NC}) Columns    ${CYAN}Enter${NC}) Return"
-        _ui_prompt "Firmware" "#, all, overview, update, col, Enter"
+        echo -e "  ${YELLOW}#${NC}) View bundle    ${GREEN}all${NC}) Expand all    ${GREEN}overview${NC}) Firmware overview    ${GREEN}update${NC}) Update    ${GREEN}r${NC}) Refresh    ${GREEN}col${NC}) Columns    ${CYAN}Enter${NC}) Return"
+        _ui_prompt "Firmware" "#, all, overview, update, r, col, Enter"
         local _fwsel
         read -r _fwsel
 
@@ -42063,6 +42119,10 @@ manage_firmware_bundles() {
             all|ALL)
                 _fw_view_all_expanded "$_fw_json"
                 continue
+                ;;
+            r|R|refresh|REFRESH)
+                rm -f "$FW_BUNDLE_CACHE" 2>/dev/null
+                return  # Return to re-render (will re-fetch)
                 ;;
             col|COL|columns|COLUMNS)
                 _col_picker "FWB" "Firmware Bundles"
