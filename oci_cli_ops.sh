@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.29.3"
+readonly SCRIPT_VERSION="3.30.0"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13137,27 +13137,33 @@ display_gpu_management_menu() {
         "${COMPUTE_CLUSTER_CACHE}|Compute Clusters" \
         "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map"
     
-    # ── Discovery ──
+    # ── Discovery (each step individually timed) ──
     _step_init
-    
-    # Fabrics
+    local _disc_start _disc_elapsed _disc_total_start
+    _disc_total_start=$(date +%s%N 2>/dev/null || date +%s)
+
+    # 1. Fabrics (sequential — must complete before parallel phase)
     if is_cache_fresh "$FABRIC_CACHE"; then
         _step_complete "fabrics($(_clc "$FABRIC_CACHE") cached)"
     else
         _step_active "fabrics"
+        _disc_start=$(date +%s%N 2>/dev/null || date +%s)
         fetch_gpu_fabrics
-        _step_complete "fabrics($(_clc "$FABRIC_CACHE"))"
+        _disc_elapsed=$(( ( $(date +%s%N 2>/dev/null || date +%s) - _disc_start ) / 1000000 ))
+        _step_complete "fabrics($(_clc "$FABRIC_CACHE") ${_disc_elapsed}ms)"
     fi
-    
+
     local _fc
     _fc=$(_clc "$FABRIC_CACHE")
 
     # Skip remaining discovery if no fabrics exist
     if [[ "${_fc:-0}" -gt 0 ]]; then
 
-    # Parallel: GPU clusters + instance configs + compute clusters (all independent, cache-file based)
+    # 2-4. Parallel: GPU clusters + instance configs + compute clusters
     local _gpu_pids=() _gpu_stale=0
-    
+    local _timing_dir="${TEMP_DIR}/c4_timing_$$"
+    mkdir -p "$_timing_dir"
+
     local _gc_cached=false
     if is_cache_fresh "$CLUSTER_CACHE" && is_cache_fresh "$INSTANCE_CLUSTER_MAP_CACHE"; then
         local _transitional
@@ -13166,31 +13172,62 @@ display_gpu_management_menu() {
         [[ "$_transitional" -eq 0 ]] && _gc_cached=true
     fi
     if [[ "$_gc_cached" != "true" ]]; then
-        ( fetch_gpu_clusters ) &
+        ( local _t0; _t0=$(date +%s%N 2>/dev/null || date +%s)
+          fetch_gpu_clusters
+          echo "$(( ( $(date +%s%N 2>/dev/null || date +%s) - _t0 ) / 1000000 ))" > "$_timing_dir/clusters"
+        ) &
         _gpu_pids+=($!); ((_gpu_stale++))
     fi
 
     if ! is_cache_fresh "$INSTANCE_CONFIG_CACHE"; then
-        ( fetch_instance_configurations ) &
+        ( local _t0; _t0=$(date +%s%N 2>/dev/null || date +%s)
+          fetch_instance_configurations
+          echo "$(( ( $(date +%s%N 2>/dev/null || date +%s) - _t0 ) / 1000000 ))" > "$_timing_dir/ic"
+        ) &
         _gpu_pids+=($!); ((_gpu_stale++))
     fi
 
     if ! is_cache_fresh "$COMPUTE_CLUSTER_CACHE"; then
-        ( fetch_compute_clusters ) &
+        ( local _t0; _t0=$(date +%s%N 2>/dev/null || date +%s)
+          fetch_compute_clusters
+          echo "$(( ( $(date +%s%N 2>/dev/null || date +%s) - _t0 ) / 1000000 ))" > "$_timing_dir/cc"
+        ) &
         _gpu_pids+=($!); ((_gpu_stale++))
     fi
-    
+
     if [[ ${#_gpu_pids[@]} -gt 0 ]]; then
         _step_active "GPU infra(${_gpu_stale} parallel)"
         wait "${_gpu_pids[@]}" 2>/dev/null
     fi
-    
-    _step_complete "GPU clusters($(_clc "$CLUSTER_CACHE"))"
-    _step_complete "instance configs($(_clc "$INSTANCE_CONFIG_CACHE"))"
-    _step_complete "compute clusters($(_clc "$COMPUTE_CLUSTER_CACHE"))"
+
+    # Report per-step timing
+    local _gc_time _ic_time _cc_time
+    if [[ -f "$_timing_dir/clusters" ]]; then
+        _gc_time="$(cat "$_timing_dir/clusters")ms"
+    else
+        _gc_time="cached"
+    fi
+    if [[ -f "$_timing_dir/ic" ]]; then
+        _ic_time="$(cat "$_timing_dir/ic")ms"
+    else
+        _ic_time="cached"
+    fi
+    if [[ -f "$_timing_dir/cc" ]]; then
+        _cc_time="$(cat "$_timing_dir/cc")ms"
+    else
+        _cc_time="cached"
+    fi
+    rm -rf "$_timing_dir" 2>/dev/null
+
+    _step_complete "GPU clusters($(_clc "$CLUSTER_CACHE") ${_gc_time})"
+    _step_complete "instance configs($(_clc "$INSTANCE_CONFIG_CACHE") ${_ic_time})"
+    _step_complete "compute clusters($(_clc "$COMPUTE_CLUSTER_CACHE") ${_cc_time})"
 
     fi  # end skip if no fabrics
 
+    # Total discovery time
+    local _disc_total_ms=$(( ( $(date +%s%N 2>/dev/null || date +%s) - _disc_total_start ) / 1000000 ))
+    _step_complete "total(${_disc_total_ms}ms)"
     _step_finish
     echo ""
     _ui_subheader "GPU Memory Fabrics & Clusters" 0
