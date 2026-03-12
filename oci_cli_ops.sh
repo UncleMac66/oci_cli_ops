@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.1"
+readonly SCRIPT_VERSION="3.30.2"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -41948,6 +41948,35 @@ manage_firmware_bundles() {
         done < <(grep -v "^#" "$COMPUTE_HOST_CACHE" | cut -d'|' -f5 | sort -u)
     fi
 
+    # Build platform → fabric mapping for hints
+    # COMPUTE_HOST_CACHE: field 5=platform, field 15=GPUFabricID
+    # FABRIC_CACHE: field 1=display-name, field 3=OCID
+    declare -A _plat_fabric_names=()   # platform → "name1, name2, ..."
+    declare -A _plat_fabric_count=()   # platform → count of unique fabrics
+    if [[ -f "$COMPUTE_HOST_CACHE" && -f "$FABRIC_CACHE" ]]; then
+        # Build fabric OCID → name lookup
+        declare -A _fab_name_map=()
+        while IFS='|' read -r _fn _ _focid _; do
+            [[ -n "$_focid" && "$_focid" != \#* ]] && _fab_name_map["$_focid"]="$_fn"
+        done < <(grep -v "^#" "$FABRIC_CACHE")
+
+        # Map each platform to its unique fabric OCIDs
+        declare -A _plat_fab_seen=()
+        while IFS='|' read -r _ _ _ _ _plat _ _ _ _ _ _ _ _ _ _fab_ocid _; do
+            [[ -z "$_plat" || "$_plat" == "N/A" || -z "$_fab_ocid" || "$_fab_ocid" == "N/A" ]] && continue
+            local _pf_key="${_plat}|${_fab_ocid}"
+            [[ -n "${_plat_fab_seen[$_pf_key]:-}" ]] && continue
+            _plat_fab_seen["$_pf_key"]=1
+            local _fname="${_fab_name_map[$_fab_ocid]:-${_fab_ocid: -5}}"
+            _plat_fabric_count["$_plat"]=$(( ${_plat_fabric_count["$_plat"]:-0} + 1 ))
+            if [[ -n "${_plat_fabric_names[$_plat]:-}" ]]; then
+                _plat_fabric_names["$_plat"]+=", ${_fname}"
+            else
+                _plat_fabric_names["$_plat"]="$_fname"
+            fi
+        done < <(grep -v "^#" "$COMPUTE_HOST_CACHE")
+    fi
+
     local selected_platform=""
     if [[ ${#_platforms[@]} -eq 0 ]]; then
         echo -e "  ${YELLOW}No platforms found. Enter a platform manually.${NC}"
@@ -41957,13 +41986,24 @@ manage_firmware_bundles() {
         [[ -z "$selected_platform" ]] && return
     elif [[ ${#_platforms[@]} -eq 1 ]]; then
         selected_platform="${_platforms[0]}"
-        echo -e "  ${WHITE}Platform:${NC} ${CYAN}${selected_platform}${NC} (from Compute Hosts)"
+        local _fc_hint="${_plat_fabric_count[$selected_platform]:-0} fabrics"
+        echo -e "  ${WHITE}Platform:${NC} ${CYAN}${selected_platform}${NC}  ${GRAY}← ${_fc_hint}${NC}"
     else
         echo -e "  ${WHITE}Select platform:${NC}"
         local _pidx=0
         for _p in "${_platforms[@]}"; do
             ((_pidx++))
-            echo -e "    ${GREEN}${_pidx}${NC}) ${_p}"
+            local _fc=${_plat_fabric_count[$_p]:-0}
+            local _fnames="${_plat_fabric_names[$_p]:-}"
+            # Truncate fabric names list if too long
+            if [[ ${#_fnames} -gt 60 ]]; then
+                _fnames="${_fnames:0:57}..."
+            fi
+            if [[ $_fc -gt 0 ]]; then
+                printf "    ${GREEN}%d${NC}) ${CYAN}%-20s${NC} ${GRAY}← %d fabrics (%s)${NC}\n" "$_pidx" "$_p" "$_fc" "$_fnames"
+            else
+                printf "    ${GREEN}%d${NC}) ${CYAN}%-20s${NC}\n" "$_pidx" "$_p"
+            fi
         done
         echo ""
         echo -n -e "  ${CYAN}Select #: ${NC}"
