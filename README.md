@@ -372,7 +372,7 @@ Focus can be saved to `variables.sh` via `env` → `s` (save). The current focus
 
 ## Feature Previews
 
-Sample terminal output for key management screens. All data is sanitized — no real OCIDs, tenancy names, or infrastructure details.
+Sample terminal output for key management screens.
 
 ---
 
