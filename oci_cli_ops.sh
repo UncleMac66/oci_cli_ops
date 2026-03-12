@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.28.0"
+readonly SCRIPT_VERSION="3.28.1"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -41799,13 +41799,19 @@ manage_firmware_bundles() {
 
     [[ -z "$selected_platform" ]] && return
 
-    # ── Collect current/target firmware bundle IDs from fabric cache ──
-    local _current_fw="" _target_fw="" _fw_state=""
+    # ── Collect current/target firmware bundle counts from ALL fabrics ──
+    declare -A _fw_cur_count=()    # bundle OCID → count of fabrics using as current
+    declare -A _fw_tgt_count=()    # bundle OCID → count of fabrics targeting
+    declare -A _fw_state_count=()  # firmware-update-state → count
+    local _total_fabrics=0
     if [[ -f "$FABRIC_CACHE" ]]; then
         # Fields: 1=Name|2=Last5|3=OCID|4=State|5=Healthy|6=Avail|7=Total|8=CurrentFW|9=TargetFW|10=FWState
-        _current_fw=$(grep -v "^#" "$FABRIC_CACHE" | head -1 | cut -d'|' -f8)
-        _target_fw=$(grep -v "^#" "$FABRIC_CACHE" | head -1 | cut -d'|' -f9)
-        _fw_state=$(grep -v "^#" "$FABRIC_CACHE" | head -1 | cut -d'|' -f10)
+        while IFS='|' read -r _ _ _ _ _ _ _ _fcur _ftgt _fwst _; do
+            ((_total_fabrics++))
+            [[ -n "$_fcur" && "$_fcur" != "N/A" ]] && _fw_cur_count["$_fcur"]=$(( ${_fw_cur_count["$_fcur"]:-0} + 1 ))
+            [[ -n "$_ftgt" && "$_ftgt" != "N/A" ]] && _fw_tgt_count["$_ftgt"]=$(( ${_fw_tgt_count["$_ftgt"]:-0} + 1 ))
+            [[ -n "$_fwst" && "$_fwst" != "N/A" ]] && _fw_state_count["$_fwst"]=$(( ${_fw_state_count["$_fwst"]:-0} + 1 ))
+        done < <(grep -v "^#" "$FABRIC_CACHE")
     fi
 
     # ── Fetch firmware bundles ──
@@ -41855,17 +41861,60 @@ manage_firmware_bundles() {
     echo ""
     echo -e "  ${BOLD}${WHITE}Platform:${NC} ${CYAN}${selected_platform}${NC}"
 
-    # Show current fabric firmware context if available
-    if [[ -n "$_current_fw" && "$_current_fw" != "N/A" ]]; then
-        echo -e "  ${BOLD}${WHITE}Current Firmware (fabric):${NC} ${GREEN}${_current_fw}${NC}"
-    fi
-    if [[ -n "$_target_fw" && "$_target_fw" != "N/A" && "$_target_fw" != "$_current_fw" ]]; then
-        echo -e "  ${BOLD}${WHITE}Target Firmware (fabric):${NC}  ${YELLOW}${_target_fw}${NC}"
-    fi
-    if [[ -n "$_fw_state" && "$_fw_state" != "N/A" ]]; then
-        local _fws_color
-        _fws_color=$(color_firmware_state "$_fw_state")
-        echo -e "  ${BOLD}${WHITE}Firmware Update State:${NC}     ${_fws_color}${_fw_state}${NC}"
+    # Show per-fabric firmware summary
+    if [[ $_total_fabrics -gt 0 ]]; then
+        echo -e "  ${BOLD}${WHITE}Fabrics:${NC} ${_total_fabrics} total"
+
+        # Current firmware — show each unique bundle with fabric count
+        if [[ ${#_fw_cur_count[@]} -gt 0 ]]; then
+            local _first_cur=true
+            for _cid in "${!_fw_cur_count[@]}"; do
+                local _cnt=${_fw_cur_count[$_cid]}
+                local _clabel
+                [[ $_cnt -eq $_total_fabrics ]] && _clabel="all ${_total_fabrics} fabrics" || _clabel="${_cnt}/${_total_fabrics} fabrics"
+                if [[ "$_first_cur" == "true" ]]; then
+                    echo -e "  ${BOLD}${WHITE}Current Firmware:${NC}          ${GREEN}${_cid}${NC}  ${GRAY}(${_clabel})${NC}"
+                    _first_cur=false
+                else
+                    echo -e "                             ${GREEN}${_cid}${NC}  ${GRAY}(${_clabel})${NC}"
+                fi
+            done
+        fi
+
+        # Target firmware — show bundles being targeted (skip if same as current)
+        if [[ ${#_fw_tgt_count[@]} -gt 0 ]]; then
+            local _first_tgt=true
+            for _tid in "${!_fw_tgt_count[@]}"; do
+                # Skip if this target is the same bundle as current on all fabrics
+                [[ -n "${_fw_cur_count[$_tid]:-}" && ${_fw_cur_count[$_tid]} -eq $_total_fabrics ]] && continue
+                local _tcnt=${_fw_tgt_count[$_tid]}
+                local _tlabel
+                [[ $_tcnt -eq $_total_fabrics ]] && _tlabel="all ${_total_fabrics} fabrics" || _tlabel="${_tcnt}/${_total_fabrics} fabrics"
+                if [[ "$_first_tgt" == "true" ]]; then
+                    echo -e "  ${BOLD}${WHITE}Target Firmware:${NC}           ${YELLOW}${_tid}${NC}  ${GRAY}(${_tlabel})${NC}"
+                    _first_tgt=false
+                else
+                    echo -e "                             ${YELLOW}${_tid}${NC}  ${GRAY}(${_tlabel})${NC}"
+                fi
+            done
+        fi
+
+        # Firmware update states — show each unique state with count
+        if [[ ${#_fw_state_count[@]} -gt 0 ]]; then
+            local _state_parts=""
+            for _st in "${!_fw_state_count[@]}"; do
+                local _stc=${_fw_state_count[$_st]}
+                local _stcolor
+                _stcolor=$(color_firmware_state "$_st")
+                [[ -n "$_state_parts" ]] && _state_parts+="  "
+                if [[ $_stc -eq $_total_fabrics ]]; then
+                    _state_parts+="${_stcolor}${_st}${NC} ${GRAY}(all ${_total_fabrics})${NC}"
+                else
+                    _state_parts+="${_stcolor}${_st}${NC} ${GRAY}(${_stc}/${_total_fabrics})${NC}"
+                fi
+            done
+            echo -e "  ${BOLD}${WHITE}Firmware Update State:${NC}     ${_state_parts}"
+        fi
     fi
     echo ""
 
@@ -41938,11 +41987,23 @@ manage_firmware_bundles() {
             DELETED|FAILED) _state_color="$RED" ;;
         esac
 
-        # Indicator: current / target from fabric — append to OCID
-        local _indicator=""
-        [[ "$_fwid" == "$_current_fw" ]] && _indicator="  ← current"
-        [[ "$_fwid" == "$_target_fw" && "$_target_fw" != "$_current_fw" ]] && _indicator="  ← target"
-        local _ocid_display="${_fwid}${_indicator}"
+        # Build fabric usage badge via _COL_ROW_SUFFIX (appended after row)
+        local _suffix=""
+        local _cur_n=${_fw_cur_count["$_fwid"]:-0}
+        local _tgt_n=${_fw_tgt_count["$_fwid"]:-0}
+        if [[ $_total_fabrics -eq 1 ]]; then
+            # Single fabric — simple labels
+            [[ $_cur_n -gt 0 ]] && _suffix=" ${GREEN}← current${NC}"
+            [[ $_tgt_n -gt 0 && $_cur_n -eq 0 ]] && _suffix=" ${YELLOW}← target${NC}"
+        elif [[ $_total_fabrics -gt 1 ]]; then
+            local _parts=""
+            [[ $_cur_n -gt 0 ]] && _parts="${GREEN}← cur(${_cur_n}/${_total_fabrics})${NC}"
+            if [[ $_tgt_n -gt 0 && $_cur_n -ne $_total_fabrics ]]; then
+                [[ -n "$_parts" ]] && _parts+=" "
+                _parts+="${YELLOW}← tgt(${_tgt_n}/${_total_fabrics})${NC}"
+            fi
+            [[ -n "$_parts" ]] && _suffix=" ${_parts}"
+        fi
 
         # Truncate timestamps to date portion (YYYY-MM-DD HH:MM)
         local _created_short="${_fwcreated:0:16}"
@@ -41950,7 +42011,8 @@ manage_firmware_bundles() {
         local _updated_short="${_fwupdated:0:16}"
         [[ "$_fwupdated" == "N/A" ]] && _updated_short="N/A"
 
-        _col_print_row "FWB" "$_fw_idx" "$_fwstate" "${_fwname:0:35}" "$_created_short" "$_updated_short" "$_fwdesc" "$_ocid_display" "$_state_color"
+        _COL_ROW_SUFFIX="$_suffix"
+        _col_print_row "FWB" "$_fw_idx" "$_fwstate" "${_fwname:0:35}" "$_created_short" "$_updated_short" "$_fwdesc" "$_fwid" "$_state_color"
     done < "$_fw_parsed"
     rm -f "$_fw_parsed" 2>/dev/null
 
@@ -41999,7 +42061,7 @@ manage_firmware_bundles() {
                 continue
                 ;;
             all|ALL)
-                _fw_view_all_expanded "$_fw_json" "$_current_fw" "$_target_fw"
+                _fw_view_all_expanded "$_fw_json"
                 continue
                 ;;
             col|COL|columns|COLUMNS)
@@ -42157,10 +42219,22 @@ _fw_overview() {
 
 #--------------------------------------------------------------------------------
 # Firmware Bundle — Expand all bundles showing firmware components
-# Args: $1 = firmware list JSON, $2 = current_fw OCID, $3 = target_fw OCID
+# Args: $1 = firmware list JSON
+# Uses: FABRIC_CACHE for per-fabric current/target counts
 #--------------------------------------------------------------------------------
 _fw_view_all_expanded() {
-    local _fw_json="$1" _current_fw="${2:-}" _target_fw="${3:-}"
+    local _fw_json="$1"
+
+    # Build per-fabric firmware counts from cache
+    declare -A _ex_cur_count=() _ex_tgt_count=()
+    local _ex_total=0
+    if [[ -f "$FABRIC_CACHE" ]]; then
+        while IFS='|' read -r _ _ _ _ _ _ _ _fcur _ftgt _; do
+            ((_ex_total++))
+            [[ -n "$_fcur" && "$_fcur" != "N/A" ]] && _ex_cur_count["$_fcur"]=$(( ${_ex_cur_count["$_fcur"]:-0} + 1 ))
+            [[ -n "$_ftgt" && "$_ftgt" != "N/A" ]] && _ex_tgt_count["$_ftgt"]=$(( ${_ex_tgt_count["$_ftgt"]:-0} + 1 ))
+        done < <(grep -v "^#" "$FABRIC_CACHE")
+    fi
 
     echo ""
     _ui_subheader "All Firmware Bundles — Expanded" 0
@@ -42191,8 +42265,20 @@ _fw_view_all_expanded() {
         esac
 
         local _indicator=""
-        [[ "$_bid" == "$_current_fw" ]] && _indicator="  ${GREEN}← current${NC}"
-        [[ "$_bid" == "$_target_fw" && "$_target_fw" != "$_current_fw" ]] && _indicator="  ${YELLOW}← target${NC}"
+        local _ex_cn=${_ex_cur_count["$_bid"]:-0}
+        local _ex_tn=${_ex_tgt_count["$_bid"]:-0}
+        if [[ $_ex_total -eq 1 ]]; then
+            [[ $_ex_cn -gt 0 ]] && _indicator="  ${GREEN}← current${NC}"
+            [[ $_ex_tn -gt 0 && $_ex_cn -eq 0 ]] && _indicator="  ${YELLOW}← target${NC}"
+        elif [[ $_ex_total -gt 1 ]]; then
+            local _ex_parts=""
+            [[ $_ex_cn -gt 0 ]] && _ex_parts="${GREEN}← current (${_ex_cn}/${_ex_total} fabrics)${NC}"
+            if [[ $_ex_tn -gt 0 && $_ex_cn -ne $_ex_total ]]; then
+                [[ -n "$_ex_parts" ]] && _ex_parts+=" "
+                _ex_parts+="${YELLOW}← target (${_ex_tn}/${_ex_total} fabrics)${NC}"
+            fi
+            [[ -n "$_ex_parts" ]] && _indicator="  ${_ex_parts}"
+        fi
 
         echo -e "  ${YELLOW}${_bi}${NC}) ${_state_color}[${_bstate}]${NC} ${WHITE}${_bname}${NC}${_indicator}"
         echo -e "     ${GRAY}${_bdesc}${NC}"
