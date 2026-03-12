@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.0"
+readonly SCRIPT_VERSION="3.30.1"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -596,6 +596,10 @@ declare -gA CACHE_TTL_MAP=(
     ["$LIMITS_SEARCH_INDEX"]=86400
     # Firmware bundles: 30m (bundle releases are infrequent)
     ["$FW_BUNDLE_CACHE"]=1800
+    # Availability domains: 24h (ADs don't change)
+    ["$AD_LIST_CACHE"]=86400
+    # Compute clusters: 1h (infrequent changes)
+    ["$COMPUTE_CLUSTER_CACHE"]=3600
     # Everything else: default CACHE_MAX_AGE (300s/5m)
 )
 # Lookup helper — returns TTL for a cache file, defaults to CACHE_MAX_AGE
@@ -2483,9 +2487,13 @@ fetch_compute_clusters() {
         echo "# Format: ComputeClusterOCID|DisplayName|AvailabilityDomain|LifecycleState|TimeCreated"
     } | _cache_write "$COMPUTE_CLUSTER_CACHE"
     
-    # Get availability domains
+    # Get availability domains (use cached AD list or fetch via _discover_ads)
     local ad_list
-    ad_list=$(oci iam availability-domain list --compartment-id "$compartment" --region "$region" --query 'data[].name' --raw-output 2>/dev/null | jq -r '.[]' 2>/dev/null)
+    if is_cache_fresh "$AD_LIST_CACHE" 2>/dev/null && [[ -s "$AD_LIST_CACHE" ]]; then
+        ad_list=$(jq -r '.data[].name' "$AD_LIST_CACHE" 2>/dev/null)
+    else
+        ad_list=$(oci iam availability-domain list --compartment-id "$compartment" --region "$region" --query 'data[].name' --raw-output 2>/dev/null | jq -r '.[]' 2>/dev/null)
+    fi
     
     # Fetch compute clusters from each AD
     local ad
@@ -31372,7 +31380,7 @@ _parse_targets() {
 
 #--------------------------------------------------------------------------------
 # AD Discovery — populate _AD_LIST and _AD_SHORT arrays
-# Caches to AD_LIST_CACHE (300s default TTL)
+# Caches to AD_LIST_CACHE (24h TTL — ADs don't change)
 # Uses OCI IAM API (has full prefixed names needed by capacity report API)
 # Falls back to compute limits cache if IAM and AD cache both fail
 # Args: $1 = tenancy_id/compartment_id for API call
