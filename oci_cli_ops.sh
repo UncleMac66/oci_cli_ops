@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.29.1"
+readonly SCRIPT_VERSION="3.29.2"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -41555,15 +41555,37 @@ interactive_gpu_management() {
                     echo -e "    ${YELLOW}3${NC}) Instance Config    [${_ic_icon}]"
                     echo -e "    ${CYAN}Enter${NC}) Cancel"
                     echo ""
+                    echo -e "  ${GRAY}Select: 1, 2, 3, 1,3, 1-3, all${NC}"
                     echo -n -e "  ${CYAN}Toggle #: ${NC}"
                     local _tsel
                     read -r _tsel
-                    case "${_tsel:-}" in
-                        1) [[ "$_C4_SHOW_FW" == "true" ]] && _C4_SHOW_FW=false || _C4_SHOW_FW=true ;;
-                        2) [[ "$_C4_SHOW_CC" == "true" ]] && _C4_SHOW_CC=false || _C4_SHOW_CC=true ;;
-                        3) [[ "$_C4_SHOW_IC" == "true" ]] && _C4_SHOW_IC=false || _C4_SHOW_IC=true ;;
-                        *) continue ;;
-                    esac
+                    [[ -z "$_tsel" ]] && continue
+                    # Expand selection into individual numbers
+                    local -a _tnums=()
+                    if [[ "${_tsel,,}" == "all" ]]; then
+                        _tnums=(1 2 3)
+                    else
+                        # Split on commas, expand ranges
+                        local _tpart
+                        for _tpart in ${_tsel//,/ }; do
+                            if [[ "$_tpart" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                                local _ts=${BASH_REMATCH[1]} _te=${BASH_REMATCH[2]}
+                                for (( _ti=_ts; _ti<=_te; _ti++ )); do
+                                    _tnums+=("$_ti")
+                                done
+                            elif [[ "$_tpart" =~ ^[0-9]+$ ]]; then
+                                _tnums+=("$_tpart")
+                            fi
+                        done
+                    fi
+                    [[ ${#_tnums[@]} -eq 0 ]] && continue
+                    for _tn in "${_tnums[@]}"; do
+                        case "$_tn" in
+                            1) [[ "$_C4_SHOW_FW" == "true" ]] && _C4_SHOW_FW=false || _C4_SHOW_FW=true ;;
+                            2) [[ "$_C4_SHOW_CC" == "true" ]] && _C4_SHOW_CC=false || _C4_SHOW_CC=true ;;
+                            3) [[ "$_C4_SHOW_IC" == "true" ]] && _C4_SHOW_IC=false || _C4_SHOW_IC=true ;;
+                        esac
+                    done
                     break  # Redraw display with new toggle state
                     ;;
                 r|R|refresh|REFRESH)
