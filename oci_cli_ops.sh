@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.2"
+readonly SCRIPT_VERSION="3.30.3"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -32134,15 +32134,15 @@ _PROP_SEARCH_INDICES=()
 # Colors: @1=state, @2=k8s, @3=cordon, @4=taint, @5=pods
 #--------------------------------------------------------------------------------
 _INST_COL_CONF="$INST_COLUMNS_CONF"
-_INST_COL_KEYS=(           "id"     "imp"    "name"         "state"  "k8s"   "cordon"  "taint"    "pods"  "shape"  "ad"   "fd"   "created"  "host_id"      "rack_id"      "sn"           "ocid"           )
-_INST_COL_LABELS=(         "ID"     "I"      "Display Name" "State"  "K8s"   "Cordon"  "Taint"    "Pods"  "Shape"  "AD"   "FD"   "Created"  "Host ID"      "Rack ID"      "SN"           "Instance OCID"  )
-_INST_COL_DEFAULT_WIDTHS=( 5        1        55             9        8       8         10         5       20       3      3      18         14             12             12             98               )
-_INST_COL_WIDTHS=(         5        1        55             9        8       8         10         5       20       3      3      18         14             12             12             98               )
-_INST_COL_ALIGN=(          "-"      "-"      "-"            "-"      "-"     "-"       "-"        "-"     "-"      "-"    "-"    "-"        "-"            "-"            "-"            "-"              )
-_INST_COL_FMTS=(           "%-5.5s" "%-1.1s" "%-55.55s"     "%-9.9s" "%-8.8s" "%-8.8s" "%-10.10s" "%-5.5s" "%-20.20s" "%-3.3s" "%-3.3s" "%-18.18s" "%-14.14s"     "%-12.12s"     "%-12.12s"     "%-98.98s"       )
-_INST_COL_COLORS=(         "YELLOW" "@6"     ""             "@1"     "@2"    "@3"      "@4"       "@5"    ""       ""     ""     "GRAY"     "CYAN"         "CYAN"         "CYAN"         "YELLOW"         )
+_INST_COL_KEYS=(           "id"     "imp"    "name"         "state"  "k8s"   "cordon"  "taint"    "pods"  "shape"  "ad"   "fd"   "created"  "age"    "host_id"      "rack_id"      "sn"           "ocid"           )
+_INST_COL_LABELS=(         "ID"     "I"      "Display Name" "State"  "K8s"   "Cordon"  "Taint"    "Pods"  "Shape"  "AD"   "FD"   "Created"  "(Age)"  "Host ID"      "Rack ID"      "SN"           "Instance OCID"  )
+_INST_COL_DEFAULT_WIDTHS=( 5        1        55             9        8       8         10         5       20       3      3      18         6        14             12             12             98               )
+_INST_COL_WIDTHS=(         5        1        55             9        8       8         10         5       20       3      3      18         6        14             12             12             98               )
+_INST_COL_ALIGN=(          "-"      "-"      "-"            "-"      "-"     "-"       "-"        "-"     "-"      "-"    "-"    "-"        "-"      "-"            "-"            "-"            "-"              )
+_INST_COL_FMTS=(           "%-5.5s" "%-1.1s" "%-55.55s"     "%-9.9s" "%-8.8s" "%-8.8s" "%-10.10s" "%-5.5s" "%-20.20s" "%-3.3s" "%-3.3s" "%-18.18s" "%-6.6s" "%-14.14s"     "%-12.12s"     "%-12.12s"     "%-98.98s"       )
+_INST_COL_COLORS=(         "YELLOW" "@6"     ""             "@1"     "@2"    "@3"      "@4"       "@5"    ""       ""     ""     "GRAY"     "GRAY"   "CYAN"         "CYAN"         "CYAN"         "YELLOW"         )
 _INST_COL_LOCKED=( "id" )
-_INST_COL_DEFAULTS=( "id" "imp" "name" "state" "k8s" "cordon" "taint" "pods" "shape" "ad" "fd" "created" "host_id" "rack_id" "sn" )
+_INST_COL_DEFAULTS=( "id" "imp" "name" "state" "k8s" "cordon" "taint" "pods" "shape" "ad" "fd" "created" "age" "host_id" "rack_id" "sn" )
 
 # Format globals — INST (Instance List View)
 _INST_ENABLED_COLS=()
@@ -33619,6 +33619,10 @@ manage_compute_instances() {
                 time_display="${time_display/T/ }"
             fi
 
+            # Calculate age from created date
+            local _inst_age=""
+            _inst_age=$(_days_since "$time_created")
+
             # O(1) compute host impact lookup instead of grep per row
             local imp_indicator=" " imp_color="$NC"
             if [[ "${_ch_imp_map[$ocid]:-}" == "true" ]]; then
@@ -33626,7 +33630,7 @@ manage_compute_instances() {
                 imp_color="$LIGHT_RED"
             fi
 
-            _col_print_row "INST" "$iid" "$imp_indicator" "${name:0:${_INST_COL_WIDTHS[2]}}" "${state:0:${_INST_COL_WIDTHS[3]}}" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$shape_trunc" "$ad_short" "$fd_short" "$time_display" "$host_id" "$rack_id" "$serial_num" "$ocid" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pod_color" "$imp_color"
+            _col_print_row "INST" "$iid" "$imp_indicator" "${name:0:${_INST_COL_WIDTHS[2]}}" "${state:0:${_INST_COL_WIDTHS[3]}}" "$k8s_status" "$cordon_status" "$taint_status" "$pod_count" "$shape_trunc" "$ad_short" "$fd_short" "$time_display" "$_inst_age" "$host_id" "$rack_id" "$serial_num" "$ocid" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pod_color" "$imp_color"
         done < <(jq -r '
             .data[] |
             select(.["lifecycle-state"] != "TERMINATED") |
@@ -70158,8 +70162,8 @@ manage_custom_images() {
             _ui_subheader "Custom Images (${image_count})" 0
             echo ""
             
-            printf "  ${BOLD}%-3s %-105s %-20s %-14s %-12s %-12s${NC}\n" "#" "Image Name" "OS" "Status" "Billable GB" "Created"
-            print_separator 175
+            printf "  ${BOLD}%-3s %-113s %-20s %-14s %-12s %-12s${NC}\n" "#" "Image Name" "OS" "Status" "Billable GB" "Created"
+            print_separator 183
             
             while IFS='|' read -r img_id img_name img_os img_billable_gb img_created img_state; do
                 [[ -z "$img_id" ]] && continue
@@ -70183,7 +70187,7 @@ manage_custom_images() {
                 # Color-code status
                 local state_color; state_color=$(color_resource_state "$img_state")
                 
-                printf "  ${YELLOW}%-3s${NC} %-105s %-20s ${state_color}%-14s${NC} %-12s %-12s\n" \
+                printf "  ${YELLOW}%-3s${NC} %-113s %-20s ${state_color}%-14s${NC} %-12s %-12s\n" \
                     "$idx" "$img_name" "$img_os" "$img_state" "$size_gb" "$created_display"
                     
             done < <(jq -r '.data[] | "\(.id)|\(.["display-name"] // "Unnamed")|\(.["operating-system"] // "N/A")|\(.["billable-size-in-gbs"] // "null")|\(.["time-created"] // "N/A")|\(.["lifecycle-state"] // "UNKNOWN")"' <<< "$custom_images_json" 2>/dev/null)
