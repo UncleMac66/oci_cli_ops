@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.14"
+readonly SCRIPT_VERSION="3.30.15"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13599,9 +13599,10 @@ display_gpu_management_menu() {
                     fi
 
                     if [[ "$_C4_SHOW_IC" == "true" ]]; then
-                        # Dynamic padding so Created/Age align at col 79 (matching header)
-                        # Sub-prefix(10) + tree(3) + label(18) + name(var) + pad = 79
-                        local _ic_pad=$(( 48 - ${#ic_name} ))
+                        # Align Created with CC line: target absolute col 79
+                        # prefix(10) + tree(3) + label(18) + name + pad = 79
+                        local _ic_total=$(( 31 + ${#ic_name} ))
+                        local _ic_pad=$(( 79 - _ic_total ))
                         (( _ic_pad < 2 )) && _ic_pad=2
                         printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%s${NC}%*s${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
                             "Instance Config: " "$ic_name" "$_ic_pad" "" "$_ic_date" "$_ic_age"
@@ -43496,9 +43497,9 @@ update_gpu_memory_cluster_interactive() {
     # List available GPU Memory Clusters
     echo -e "${WHITE}Available GPU Memory Clusters:${NC}"
     echo ""
-    printf "  ${BOLD}%-5s  %-35s  %-12s  %-30s  %5s  %7s  %5s  %12s${NC}\n" \
+    printf "  ${BOLD}%-5s  %-35s  %-12s  %-36s  %5s  %7s  %5s  %12s${NC}\n" \
         "ID" "Cluster Name" "State" "Fabric" "Total" "Healthy" "Avail" "Cluster Size"
-    print_separator 125
+    print_separator 133
     
     # Collect cluster lines for sorting
     local cluster_lines_temp
@@ -43549,7 +43550,7 @@ update_gpu_memory_cluster_interactive() {
         local avail_color="${WHITE}"
         [[ "$f_avail" != "N/A" && "$f_avail" != "0" ]] && avail_color="${LIGHT_GREEN}"
 
-        printf "  ${YELLOW}%-5s${NC}  ${MAGENTA}%-35s${NC}  ${state_color}%-12s${NC}  ${CYAN}%-30s${NC}  %5s  %7s  ${avail_color}%5s${NC}  %12s\n" \
+        printf "  ${YELLOW}%-5s${NC}  ${MAGENTA}%-35s${NC}  ${state_color}%-12s${NC}  ${CYAN}%-36s${NC}  %5s  %7s  ${avail_color}%5s${NC}  %12s\n" \
             "$gid" "$c_name" "$c_state" "$fabric_name" "$f_total" "$f_healthy" "$f_avail" "$c_size"
     done
     
