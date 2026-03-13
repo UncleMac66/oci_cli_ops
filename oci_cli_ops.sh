@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.9"
+readonly SCRIPT_VERSION="3.30.10"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13175,7 +13175,9 @@ display_gpu_management_menu() {
         "${CLUSTER_CACHE}|GPU Clusters" \
         "${INSTANCE_CONFIG_CACHE}|Instance Configs" \
         "${COMPUTE_CLUSTER_CACHE}|Compute Clusters" \
-        "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map"
+        "${INSTANCE_CLUSTER_MAP_CACHE}|Instance Map" \
+        "${MAINT_EVENTS_CACHE}|Maintenance Events" \
+        "${FW_BUNDLE_CACHE}|Firmware Bundles"
     
     # ── Discovery (each step individually timed) ──
     _step_init
@@ -13235,13 +13237,41 @@ display_gpu_management_menu() {
         _gpu_pids+=($!); ((_gpu_stale++))
     fi
 
+    # Maintenance events — needed for [Maintenances] badge on cluster lines
+    if ! is_cache_fresh "$MAINT_EVENTS_CACHE"; then
+        ( local _t0; _t0=$(date +%s%N 2>/dev/null || date +%s)
+          oci compute instance-maintenance-event list \
+              --compartment-id "$compartment_id" \
+              --region "$region" \
+              --all \
+              --output json > "$MAINT_EVENTS_CACHE" 2>/dev/null || true
+          echo "$(( ( $(date +%s%N 2>/dev/null || date +%s) - _t0 ) / 1000000 ))" > "$_timing_dir/maint"
+        ) &
+        _gpu_pids+=($!); ((_gpu_stale++))
+    fi
+
+    # Firmware bundles — needed for [↑ FW Update Avail] indicator
+    if ! is_cache_fresh "$FW_BUNDLE_CACHE"; then
+        local _c4_platform=""
+        if [[ -f "$COMPUTE_HOST_CACHE" ]]; then
+            _c4_platform=$(grep -v '^#' "$COMPUTE_HOST_CACHE" 2>/dev/null | head -1 | cut -d'|' -f5)
+        fi
+        if [[ -n "$_c4_platform" && "$_c4_platform" != "N/A" ]]; then
+            ( local _t0; _t0=$(date +%s%N 2>/dev/null || date +%s)
+              fetch_firmware_bundles "$_c4_platform" "$region"
+              echo "$(( ( $(date +%s%N 2>/dev/null || date +%s) - _t0 ) / 1000000 ))" > "$_timing_dir/fw"
+            ) &
+            _gpu_pids+=($!); ((_gpu_stale++))
+        fi
+    fi
+
     if [[ ${#_gpu_pids[@]} -gt 0 ]]; then
         _step_active "GPU infra(${_gpu_stale} parallel)"
         wait "${_gpu_pids[@]}" 2>/dev/null
     fi
 
     # Report per-step timing
-    local _gc_time _ic_time _cc_time
+    local _gc_time _ic_time _cc_time _me_time
     if [[ -f "$_timing_dir/clusters" ]]; then
         _gc_time="$(cat "$_timing_dir/clusters")ms"
     else
@@ -13257,11 +13287,24 @@ display_gpu_management_menu() {
     else
         _cc_time="cached"
     fi
+    if [[ -f "$_timing_dir/maint" ]]; then
+        _me_time="$(cat "$_timing_dir/maint")ms"
+    else
+        _me_time="cached"
+    fi
+    local _fw_time
+    if [[ -f "$_timing_dir/fw" ]]; then
+        _fw_time="$(cat "$_timing_dir/fw")ms"
+    else
+        _fw_time="cached"
+    fi
     rm -rf "$_timing_dir" 2>/dev/null
 
     _step_complete "GPU clusters($(_clc "$CLUSTER_CACHE") ${_gc_time})"
     _step_complete "instance configs($(_clc "$INSTANCE_CONFIG_CACHE") ${_ic_time})"
     _step_complete "compute clusters($(_clc "$COMPUTE_CLUSTER_CACHE") ${_cc_time})"
+    _step_complete "maintenance events(${_me_time})"
+    _step_complete "firmware bundles(${_fw_time})"
 
     fi  # end skip if no fabrics
 
@@ -13284,8 +13327,8 @@ display_gpu_management_menu() {
     echo ""
 
     # Header for fabrics — widened columns with Created/Age
-    # Col positions: ID(0-4) Name(6-65) State(68-79) Created(81-90) Age(92-97) Total Healthy Avail OCID
-    printf "${BOLD}%-5s %-60s  %-12s %-10s %-6s %5s %7s %5s  %s${NC}\n" \
+    # Col positions: ID(0-2) Name(4-63) State(66-77) Created(79-88) Age(90-95) Total Healthy Avail OCID
+    printf "${BOLD}%-3s %-60s  %-12s %-10s %-6s %5s %7s %5s  %s${NC}\n" \
         "ID" "Display Name" "State" "Created" "(Age)" "Total" "Healthy" "Avail" "OCID"
     print_separator 160
     
@@ -13336,7 +13379,7 @@ display_gpu_management_menu() {
             _fab_age=$(_days_since "${fabric_created:-}")
 
             # Print fabric line: main info with Created/Age and OCID on same line
-            printf "${YELLOW}%-5s${NC} ${CYAN}%-60s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} ${WHITE}%7s${NC} ${avail_color}%5s${NC}  ${YELLOW}%s${NC}\n" \
+            printf "${YELLOW}%-3s${NC} ${CYAN}%-60s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} ${WHITE}%7s${NC} ${avail_color}%5s${NC}  ${YELLOW}%s${NC}\n" \
                 "$fid" "$fabric_name" "$fabric_state" "$_fab_date" "$_fab_age" "$total_hosts" "$healthy_hosts" "$avail_hosts" "$fabric_ocid"
 
             # ── Firmware line (toggleable via _C4_SHOW_FW) ──
@@ -13365,16 +13408,19 @@ display_gpu_management_menu() {
                 if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
                     _fw_upgrade=" ${CYAN}↑${NC}"
                 fi
-                # Firmware: [BADGE] ↑ then pad to col 68 for cur:, col 81 for tgt:
-                # "     ├─ " = 8, "Firmware: " = 10, badge = variable, " ↑" = 2 if upgrade → pad remaining to col 68
+                # Firmware: [BADGE] [↑ FW Update Avail] then pad to col 66 for cur:, tgt:
+                # "   ├─ " = 6, "Firmware: " = 10, badge = variable → pad remaining to col 66
                 local _fw_label="Firmware: ${_fw_badge_text}"
-                local _fw_prefix_len=$(( 8 + ${#_fw_label} ))
-                [[ -n "$_fw_upgrade" ]] && ((_fw_prefix_len += 2))
-                local _fw_pad=$(( 68 - _fw_prefix_len ))
+                local _fw_prefix_len=$(( 6 + ${#_fw_label} ))
+                if [[ -n "$_fw_upgrade" ]]; then
+                    _fw_upgrade=" ${CYAN}[↑ FW Update Avail]${NC}"
+                    ((_fw_prefix_len += 20))
+                fi
+                local _fw_pad=$(( 66 - _fw_prefix_len ))
                 [[ $_fw_pad -lt 1 ]] && _fw_pad=1
                 # Use └─ if firmware is last sub-line (no clusters will follow)
                 local _fw_tree="├─"
-                printf "     ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
                     "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
             fi
 
@@ -13448,20 +13494,18 @@ display_gpu_management_menu() {
                     fi
 
                     # Cluster line: ID, Name [Maintenances], State, Created, Age, Size, OCID
-                    # 3(indent)+3(tree)+1(sp)+4(gid)+1(sp) = 12, then name+badge fills to State col
-                    local _cl_display_name="$cluster_name"
+                    # 3(indent)+3(tree)+1(sp)+4(gid)+1(sp) = 12, then name+badge fills to State col 66
                     if [[ -n "$_cl_maint_badge" ]]; then
-                        # Print with badge inline after name — use %b for color codes
                         printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}${_cl_maint_badge}" "$gid" "$cluster_name"
-                        # Pad to column 68 (account for visible chars only)
+                        # Pad to column 66 (account for visible chars only)
                         local _cl_vis_len=$(( 12 + ${#cluster_name} + ${#_cl_maint_count} + 17 ))  # 17 = " [Maintenances: ]" visible chars
-                        local _cl_pad=$(( 68 - _cl_vis_len ))
+                        local _cl_pad=$(( 66 - _cl_vis_len ))
                         [[ $_cl_pad -lt 2 ]] && _cl_pad=2
                         printf "%${_cl_pad}s" ""
                         printf "${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} %5s %7s ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
                             "$cluster_state" "$_cl_date" "$_cl_age" "" "" "$cluster_size" "$cluster_ocid"
                     else
-                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-54s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} %5s %7s ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
+                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-52s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} %5s %7s ${WHITE}%5s${NC}  ${YELLOW}%s${NC}\n" \
                             "$gid" "$cluster_name" "$cluster_state" "$_cl_date" "$_cl_age" "" "" "$cluster_size" "$cluster_ocid"
                     fi
 
@@ -13492,12 +13536,12 @@ display_gpu_management_menu() {
                     _ic_date=$(_date_short "${_ic_created:-}")
                     _ic_age=$(_days_since "${_ic_created:-}")
 
-                    # Sub-tree indent: use continuation char for multi-cluster, spaces for last
+                    # Sub-tree indent: 10 visible chars — continuation bar at col 3 aligns with cluster tree
                     local _sub_pfx
                     if [[ "$continuation" == "│" ]]; then
-                        _sub_pfx="   ${WHITE}│${NC}       "
+                        _sub_pfx="   ${WHITE}│${NC}      "
                     else
-                        _sub_pfx="            "
+                        _sub_pfx="          "
                     fi
 
                     # Cluster detail sub-lines (toggleable via _C4_SHOW_CC / _C4_SHOW_IC)
@@ -13510,13 +13554,12 @@ display_gpu_management_menu() {
                     fi
 
                     if [[ "$_C4_SHOW_IC" == "true" ]]; then
-                        # Build IC portion with dynamic padding so date/age align
-                        local _ic_label="Instance Config: "
-                        local _ic_content="${_ic_label}${ic_name}"
-                        local _ic_pad=$(( 53 - ${#_ic_content} ))
+                        # Dynamic padding so Created/Age align at col 79 (matching header)
+                        # Sub-prefix(10) + tree(3) + label(18) + name(var) + pad = 79
+                        local _ic_pad=$(( 48 - ${#ic_name} ))
                         (( _ic_pad < 2 )) && _ic_pad=2
                         printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%s${NC}%*s${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
-                            "$_ic_label" "$ic_name" "$_ic_pad" "" "$_ic_date" "$_ic_age"
+                            "Instance Config: " "$ic_name" "$_ic_pad" "" "$_ic_date" "$_ic_age"
                     fi
                 done
             fi
