@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.5"
+readonly SCRIPT_VERSION="3.30.6"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -33674,12 +33674,13 @@ manage_compute_instances() {
         echo -e "  ${RED}terminate${NC}  - Terminate instances (e.g., 'terminate i1,i3' or 'terminate i1-i5' or 'terminate all')"
         echo -e "  ${GREEN}bvr${NC}        - Boot Volume Replacement (upgrade OKE nodes without reboot)"
         echo -e "  ${GREEN}brc${NC}        - Bulk RunCommand — execute commands across multiple instances with presets"
+        echo -e "  ${CYAN}h${NC}          - View compute host details (e.g., 'h i1')"
         echo -e "  ${MAGENTA}r${NC}          - Refresh instance list"
         echo -e "  ${CYAN}/${NC}          - Search instances (name, state, shape, OCID, K8s node)"
         echo -e "  ${CYAN}col${NC}        - Toggle column visibility"
         echo -e "  ${CYAN}back${NC}       - Return to main menu"
         echo ""
-        _ui_prompt "Compute Instances" "i#, /, taint, untaint, cordon, uncordon, drain, reboot, cdt, terminate, p, col, bvr, brc, r, back, show"
+        _ui_prompt "Compute Instances" "i#, h i#, /, taint, untaint, cordon, uncordon, drain, reboot, cdt, terminate, p, col, bvr, brc, r, back, show"
         
         local input
         read -r input
@@ -34488,6 +34489,35 @@ manage_compute_instances() {
                     [[ -n "${_NAV_JUMP:-}" ]] && break
                     [[ $ret -ne 2 ]] && break  # Exit loop unless refresh requested
                 done
+                ;;
+            h\ i[0-9]*|H\ i[0-9]*|h\ I[0-9]*|H\ I[0-9]*)
+                # View compute host for instance: h i1, h i3
+                local _h_target="${input#* }"
+                local _h_inst_ocid="${INSTANCE_INDEX_MAP[$_h_target]:-}"
+                if [[ -z "$_h_inst_ocid" ]]; then
+                    echo -e "${RED}Invalid instance ID: $_h_target${NC}"
+                    sleep 1
+                else
+                    local _h_record=""
+                    _h_record=$(get_compute_host_record "$_h_inst_ocid" 2>/dev/null)
+                    if [[ -n "$_h_record" ]]; then
+                        local _h_host_ocid=""
+                        IFS='|' read -r _ _ _ _ _ _ _ _ _h_host_ocid _ <<< "$_h_record"
+                        if [[ -n "$_h_host_ocid" && "$_h_host_ocid" != "N/A" ]]; then
+                            _ch_view_host "$_h_host_ocid"
+                        else
+                            echo -e "${YELLOW}No compute host OCID found for $_h_target${NC}"
+                            sleep 1
+                        fi
+                    else
+                        echo -e "${YELLOW}No compute host record found for $_h_target — try refreshing compute hosts (--manage, c, 10)${NC}"
+                        sleep 1
+                    fi
+                fi
+                ;;
+            h|H)
+                echo -e "${YELLOW}Usage: h i1 — view compute host for an instance${NC}"
+                sleep 1
                 ;;
             taint|untaint|cordon|uncordon|drain|reboot|cdt|terminate)
                 echo -e "${YELLOW}Usage: ${input} i1, ${input} i1,i3, ${input} i1-i5, ${input} all${NC}"
@@ -37245,6 +37275,9 @@ display_instance_details() {
         echo -e "  ${CYAN}wr${NC}) Work requests     ${CYAN}wr#${NC}) Work request detail"
         echo -e "  ${CYAN}rc${NC}) Run command       ${CYAN}rc#${NC}) Run command detail   ${RED}rcc#${NC}) Cancel run command"
         echo -e "  ${CYAN}icc${NC}) Console connections (list, create, get, plink, delete)"
+        if [[ -n "$_ch_host_ocid" && "$_ch_host_ocid" != "N/A" ]]; then
+            echo -e "  ${CYAN}h${NC})   View compute host details (${GRAY}..${_ch_host_ocid: -6}${NC})"
+        fi
 
         if [[ -n "$k8s_node_name" && -z "$oke_nodepool_id" ]]; then
             echo -e "  ${GREEN}bvr${NC}) Boot Volume Replacement"
@@ -37257,9 +37290,9 @@ display_instance_details() {
         echo -e "  ${CYAN}Enter${NC}) Return to list"
         echo ""
         if [[ -n "$k8s_node_name" ]]; then
-            _ui_prompt "Instance - ${display_name}" "r, 1-4, p, l, desc, logs, icc, re, fre, stop, 8, t, rt, T, x, j, wr, wr#, rc, rc#, rcc#, d, c, u, cd, bvr, Enter, show"
+            _ui_prompt "Instance - ${display_name}" "r, 1-4, h, p, l, desc, logs, icc, re, fre, stop, 8, t, rt, T, x, j, wr, wr#, rc, rc#, rcc#, d, c, u, cd, bvr, Enter, show"
         else
-            _ui_prompt "Instance - ${display_name}" "r, 1-4, icc, re, fre, stop, 8, t, rt, T, x, j, wr, wr#, rc, rc#, rcc#, Enter, show"
+            _ui_prompt "Instance - ${display_name}" "r, 1-4, h, icc, re, fre, stop, 8, t, rt, T, x, j, wr, wr#, rc, rc#, rcc#, Enter, show"
         fi
         
         local action
@@ -38173,6 +38206,16 @@ display_instance_details() {
         x|X)
             # Tag instance as unhealthy AND terminate
             tag_instance_unhealthy "$instance_ocid" "$display_name" "true"
+            ;;
+        h|H)
+            # View compute host details for this instance
+            if [[ -n "$_ch_host_ocid" && "$_ch_host_ocid" != "N/A" ]]; then
+                _ch_view_host "$_ch_host_ocid"
+                [[ -n "${_NAV_JUMP:-}" ]] && break
+            else
+                echo -e "  ${YELLOW}No compute host associated with this instance.${NC}"
+                sleep 1
+            fi
             ;;
         show|SHOW)
             # Re-display full instance details (same as refresh but silent)
@@ -42683,8 +42726,9 @@ _fw_update_fabric_firmware() {
     fi
 
     local -a _fab_names=() _fab_ocids=() _fab_states=() _fab_curfw=() _fab_tarfw=() _fab_fwstates=()
+    local -a _fab_total=() _fab_healthy=() _fab_avail=() _fab_suffix=()
     local _fidx=0
-    while IFS='|' read -r _fn _fsuf _focid _fstate _fhealthy _favail _ftotal _fcurfw _ftarfw _ffwstate; do
+    while IFS='|' read -r _fn _fsuf _focid _fstate _fhealthy _favail _ftotal _fcurfw _ftarfw _ffwstate _fcreated; do
         [[ -z "$_focid" ]] && continue
         ((_fidx++))
         _fab_names+=("$_fn")
@@ -42693,6 +42737,10 @@ _fw_update_fabric_firmware() {
         _fab_curfw+=("$_fcurfw")
         _fab_tarfw+=("$_ftarfw")
         _fab_fwstates+=("$_ffwstate")
+        _fab_total+=("${_ftotal:-0}")
+        _fab_healthy+=("${_fhealthy:-0}")
+        _fab_avail+=("${_favail:-0}")
+        _fab_suffix+=("$_fsuf")
     done < <(grep -v "^#" "$FABRIC_CACHE")
 
     if [[ $_fidx -eq 0 ]]; then
@@ -42701,12 +42749,26 @@ _fw_update_fabric_firmware() {
         return
     fi
 
+    # Build cluster size per fabric suffix from CLUSTER_CACHE (first cluster per suffix)
+    declare -A _fab_cluster_size=()
+    if [[ -f "$CLUSTER_CACHE" ]]; then
+        declare -A _fab_csuf_seen=()
+        while IFS='|' read -r _cc_ocid _cc_name _cc_state _cc_fsuf _cc_ic _cc_cc _cc_size; do
+            [[ -z "$_cc_fsuf" || -n "${_fab_csuf_seen[$_cc_fsuf]:-}" ]] && continue
+            _fab_csuf_seen["$_cc_fsuf"]=1
+            _fab_cluster_size["$_cc_fsuf"]="${_cc_size:-N/A}"
+        done < <(grep -v "^#" "$CLUSTER_CACHE")
+    fi
+
     # Find the latest ACTIVE bundle OCID (last by display-name sort) for upgrade comparison
     local _latest_bundle=""
     _latest_bundle=$(jq -r '[.data.items[] | select(.["lifecycle-state"] == "ACTIVE")] | sort_by(.["display-name"]) | last | .id // ""' <<< "$_fw_json" 2>/dev/null)
 
     echo -e "  ${BOLD}${WHITE}Select GPU Memory Fabric:${NC}"
     echo ""
+    printf "  ${BOLD}    %-30s  %-14s  %5s  %7s  %5s  %12s  %-12s${NC}\n" \
+        "Fabric Name" "State" "Total" "Healthy" "Avail" "Cluster Size" "FW State"
+    print_separator 100
     for _i in "${!_fab_names[@]}"; do
         local _sc="$WHITE"
         case "${_fab_states[$_i]}" in
@@ -42716,26 +42778,25 @@ _fw_update_fabric_firmware() {
             *) _sc="$RED" ;;
         esac
 
-        local _fws_badge=""
-        if [[ "${_fab_fwstates[$_i]}" != "N/A" && -n "${_fab_fwstates[$_i]}" ]]; then
-            local _fwsc
-            _fwsc=$(color_firmware_state "${_fab_fwstates[$_i]}")
-            _fws_badge="  [${_fwsc}${_fab_fwstates[$_i]}${NC}]"
+        local _fws_display="${_fab_fwstates[$_i]}"
+        local _fwsc="$GRAY"
+        if [[ "$_fws_display" != "N/A" && -n "$_fws_display" ]]; then
+            _fwsc=$(color_firmware_state "$_fws_display")
         fi
+
+        # Cluster size from CLUSTER_CACHE
+        local _csz="${_fab_cluster_size[${_fab_suffix[$_i]}]:-N/A}"
 
         # Upgrade available indicator
-        local _upgrade_badge=""
+        local _upgrade=""
         if [[ -n "$_latest_bundle" && "${_fab_curfw[$_i]}" != "$_latest_bundle" && "${_fab_curfw[$_i]}" != "N/A" ]]; then
-            _upgrade_badge="  ${CYAN}↑ upgrade available${NC}"
+            _upgrade=" ${CYAN}↑${NC}"
         fi
 
-        local _fw_inline=""
-        if [[ "${_fab_curfw[$_i]}" != "N/A" && -n "${_fab_curfw[$_i]}" ]]; then
-            _fw_inline="  ${YELLOW}${_fab_curfw[$_i]}${NC}"
-        fi
-
-        printf "    ${GREEN}%2d${NC}) ${WHITE}%-30s${NC} ${_sc}%-12s${NC}${_fws_badge}${_fw_inline}${_upgrade_badge}\n" \
-            "$((_i+1))" "${_fab_names[$_i]}" "${_fab_states[$_i]}"
+        printf "  ${GREEN}%2d${NC}) ${WHITE}%-30s${NC}  ${_sc}%-14s${NC}  %5s  %7s  %5s  %12s  ${_fwsc}%-12s${NC}%b\n" \
+            "$((_i+1))" "${_fab_names[$_i]}" "${_fab_states[$_i]}" \
+            "${_fab_total[$_i]}" "${_fab_healthy[$_i]}" "${_fab_avail[$_i]}" \
+            "$_csz" "$_fws_display" "$_upgrade"
     done
 
     echo ""
