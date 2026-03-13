@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.3"
+readonly SCRIPT_VERSION="3.30.4"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -500,6 +500,7 @@ readonly CAPACITY_TOPO_TIME_CACHE="${CACHE_DIR}/capacity_topo_time.txt"
 readonly COMPUTE_HOST_CACHE="${CACHE_DIR}/compute_hosts.txt"
 readonly COMPUTE_HOST_JSON_CACHE="${CACHE_DIR}/compute_hosts.json"
 readonly COMPUTE_HOST_DETAIL_DIR="${CACHE_DIR}/compute_host_detail"
+readonly COMPUTE_HOST_IMPACT_CACHE="${CACHE_DIR}/compute_host_impact.txt"
 readonly ANNOUNCEMENTS_LIST_CACHE="${CACHE_DIR}/announcements_list.json"
 readonly OKE_ENV_CACHE="${CACHE_DIR}/oke_environment.txt"
 readonly OKE_CLUSTER_JSON_CACHE="${CACHE_DIR}/oke_cluster.json"
@@ -600,6 +601,10 @@ declare -gA CACHE_TTL_MAP=(
     ["$AD_LIST_CACHE"]=86400
     # Compute clusters: 1h (infrequent changes)
     ["$COMPUTE_CLUSTER_CACHE"]=3600
+    # Fault details: 1h (fault metadata is static once fetched)
+    ["$FAULT_DETAILS_CACHE"]=3600
+    # Compute host impact lookup: matches compute host cache TTL
+    ["$COMPUTE_HOST_IMPACT_CACHE"]=300
     # Everything else: default CACHE_MAX_AGE (300s/5m)
 )
 # Lookup helper — returns TTL for a cache file, defaults to CACHE_MAX_AGE
@@ -1568,6 +1573,7 @@ refresh_all_caches() {
         "$CLUSTER_NETWORK_CACHE"
         "$COMPUTE_HOST_CACHE"
         "$COMPUTE_HOST_JSON_CACHE"
+        "$COMPUTE_HOST_IMPACT_CACHE"
         "$FW_BUNDLE_CACHE"
         "$BOOT_VOLUME_CACHE"
         "$IMAGE_CACHE"
@@ -9393,13 +9399,6 @@ list_maintenance_events() {
         end
     ' "$cache_file" 2>/dev/null)
 
-    # Parallel fetch for events not yet in cache
-    local fault_temp_dir="${TEMP_DIR}/fault_detail_$$"
-    mkdir -p "$fault_temp_dir" 2>/dev/null
-    local fault_fetch_count=0
-    local fault_fetch_pids=()
-    local fault_total_to_fetch=0
-
     # Build filtered event ID list based on current filter_type
     # This avoids fetching fault details for events that won't be displayed
     local filtered_evt_ids_file
@@ -9427,76 +9426,86 @@ list_maintenance_events() {
     filtered_evt_count=$(wc -l < "$filtered_evt_ids_file" 2>/dev/null | tr -d ' ')
     [[ -z "$filtered_evt_count" ]] && filtered_evt_count=0
 
-    # Count how many need fetching (only filtered events)
-    while IFS= read -r flt_evt_id; do
-        [[ -z "$flt_evt_id" ]] && continue
-        [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
-        ((fault_total_to_fetch++))
-    done < "$filtered_evt_ids_file"
+    # Parallel fetch for events not yet in cache — skip if fault cache is fresh (1hr TTL)
+    local fault_total_to_fetch=0
+    local fault_found_count=0
+    local cache_updated=false
 
-    if [[ $fault_total_to_fetch -gt 0 ]]; then
-        _step_active "Fault details(0/${fault_total_to_fetch})"
+    if ! is_cache_fresh "$FAULT_DETAILS_CACHE"; then
+        local fault_temp_dir="${TEMP_DIR}/fault_detail_$$"
+        mkdir -p "$fault_temp_dir" 2>/dev/null
+        local fault_fetch_count=0
+        local fault_fetch_pids=()
 
+        # Count how many need fetching (only filtered events)
         while IFS= read -r flt_evt_id; do
             [[ -z "$flt_evt_id" ]] && continue
             [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
-
-            (
-                local evt_detail
-                evt_detail=$(oci compute instance-maintenance-event get \
-                    --instance-maintenance-event-id "$flt_evt_id" \
-                    --region "$region" \
-                    --output json 2>/dev/null)
-                if [[ -n "$evt_detail" ]]; then
-                    local fault_line
-                    fault_line=$(jq -r '
-                        (.data["additional-details"] // {}) as $ad |
-                        (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
-                         if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
-                         if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
-                        ) as $nested |
-                        if $nested != null then
-                            "\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
-                        elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
-                            "\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
-                        else
-                            "-~-~-~-~-~-"
-                        end
-                    ' <<< "$evt_detail" 2>/dev/null)
-                    if [[ -n "$fault_line" && "$fault_line" != "-~-~-~-~-~-" ]]; then
-                        echo "$fault_line" > "$fault_temp_dir/$flt_evt_id"
-                    fi
-                fi
-            ) >/dev/null 2>&1 &
-            fault_fetch_pids+=($!)
-            ((fault_fetch_count++))
-
-            if [[ $fault_fetch_count -ge 10 ]]; then
-                wait "${fault_fetch_pids[@]}" 2>/dev/null
-                fault_fetch_pids=()
-                fault_fetch_count=0
-            fi
+            ((fault_total_to_fetch++))
         done < "$filtered_evt_ids_file"
 
-        [[ ${#fault_fetch_pids[@]} -gt 0 ]] && wait "${fault_fetch_pids[@]}" 2>/dev/null
-    fi
+        if [[ $fault_total_to_fetch -gt 0 ]]; then
+            _step_active "Fault details(0/${fault_total_to_fetch})"
 
-    # Read fetched fault details into ME_FAULT_MAP
-    local fault_found_count=0
-    local cache_updated=false
-    for fault_file in "$fault_temp_dir"/*; do
-        [[ ! -f "$fault_file" ]] && continue
-        local f_evt_id
-        f_evt_id=$(basename "$fault_file")
-        local f_data
-        f_data=$(cat "$fault_file" 2>/dev/null)
-        if [[ -n "$f_data" && "$f_data" != "-~-~-~-~-~-" ]]; then
-            ME_FAULT_MAP[$f_evt_id]="$f_data"
-            ((fault_found_count++))
-            cache_updated=true
+            while IFS= read -r flt_evt_id; do
+                [[ -z "$flt_evt_id" ]] && continue
+                [[ -n "${ME_FAULT_MAP[$flt_evt_id]:-}" ]] && continue
+
+                (
+                    local evt_detail
+                    evt_detail=$(oci compute instance-maintenance-event get \
+                        --instance-maintenance-event-id "$flt_evt_id" \
+                        --region "$region" \
+                        --output json 2>/dev/null)
+                    if [[ -n "$evt_detail" ]]; then
+                        local fault_line
+                        fault_line=$(jq -r '
+                            (.data["additional-details"] // {}) as $ad |
+                            (($ad["faultDetails"] // $ad["fault-details"] // $ad["fault_details"] // null) |
+                             if . != null then (if type == "string" then (try fromjson catch null) else . end) else null end |
+                             if type == "array" and length > 0 then .[0] elif type == "object" then . else null end
+                            ) as $nested |
+                            if $nested != null then
+                                "\($nested.faultId // $nested["fault-id"] // "-")~\($nested.faultComponent // $nested["fault-component"] // "-")~\($nested.severity // "-")~\($nested.customerDescription // $nested["customer-description"] // $nested.description // "-")~\($nested.impactDescription // $nested["impact-description"] // "-")~\($nested.recommendedAction // $nested["recommended-action"] // "-")"
+                            elif ($ad.faultId // $ad["fault-id"] // $ad["faultid"] // null) != null then
+                                "\($ad.faultId // $ad["fault-id"] // $ad["faultid"] // "-")~\($ad.faultComponent // $ad["fault-component"] // $ad.component // "-")~\($ad.severity // $ad.faultSeverity // "-")~\($ad.customerDescription // $ad["customer-description"] // $ad.description // $ad.faultDescription // "-")~\($ad.impactDescription // $ad["impact-description"] // "-")~\($ad.recommendedAction // $ad["recommended-action"] // "-")"
+                            else
+                                "-~-~-~-~-~-"
+                            end
+                        ' <<< "$evt_detail" 2>/dev/null)
+                        if [[ -n "$fault_line" && "$fault_line" != "-~-~-~-~-~-" ]]; then
+                            echo "$fault_line" > "$fault_temp_dir/$flt_evt_id"
+                        fi
+                    fi
+                ) >/dev/null 2>&1 &
+                fault_fetch_pids+=($!)
+                ((fault_fetch_count++))
+
+                if [[ $fault_fetch_count -ge 10 ]]; then
+                    wait "${fault_fetch_pids[@]}" 2>/dev/null
+                    fault_fetch_pids=()
+                    fault_fetch_count=0
+                fi
+            done < "$filtered_evt_ids_file"
+
+            [[ ${#fault_fetch_pids[@]} -gt 0 ]] && wait "${fault_fetch_pids[@]}" 2>/dev/null
         fi
-    done
-    rm -rf "${fault_temp_dir:?}" 2>/dev/null
+
+        # Read fetched fault details into ME_FAULT_MAP
+        for fault_file in "$fault_temp_dir"/*; do
+            [[ ! -f "$fault_file" ]] && continue
+            local f_evt_id
+            f_evt_id=$(basename "$fault_file")
+            local f_data
+            f_data=$(cat "$fault_file" 2>/dev/null)
+            if [[ -n "$f_data" && "$f_data" != "-~-~-~-~-~-" ]]; then
+                ME_FAULT_MAP[$f_evt_id]="$f_data"
+                ((fault_found_count++))
+                cache_updated=true
+            fi
+        done
+        rm -rf "${fault_temp_dir:?}" 2>/dev/null
+    fi
 
     # Build filtered event set for O(1) skip in display pass
     declare -A _ME_FILTERED_EVTS=()
@@ -10399,7 +10408,7 @@ list_maintenance_events() {
 
         # Refresh
         if [[ "$me_selection" == "r" || "$me_selection" == "R" || "$me_selection" == "refresh" || "$me_selection" == "REFRESH" ]]; then
-            rm -f "$MAINT_EVENTS_CACHE" "$FAULT_DETAILS_CACHE" "$ANNOUNCEMENTS_LIST_CACHE" "$COMPUTE_HOST_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$FABRIC_CACHE"
+            rm -f "$MAINT_EVENTS_CACHE" "$FAULT_DETAILS_CACHE" "$ANNOUNCEMENTS_LIST_CACHE" "$COMPUTE_HOST_CACHE" "$COMPUTE_HOST_IMPACT_CACHE" "$CLUSTER_CACHE" "$INSTANCE_CLUSTER_MAP_CACHE" "$FABRIC_CACHE"
             echo -e "${YELLOW}Cache invalidated - refreshing...${NC}"
             rm -f "$me_inst_temp"
             list_maintenance_events "$compartment_id" "$region" "true" "$filter_type" "$me_view_mode" "$me_link_announcements"
@@ -19327,7 +19336,7 @@ display_cache_stats() {
             ;;
         2)
             echo -e "${YELLOW}Clearing Compute caches...${NC}"
-            rm -f "$INSTANCE_LIST_CACHE" "$INSTANCE_CONFIG_CACHE" "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE" "$CUSTOM_IMAGE_CACHE" "$CAPACITY_TOPOLOGY_CACHE" "$COMPUTE_HOST_CACHE"
+            rm -f "$INSTANCE_LIST_CACHE" "$INSTANCE_CONFIG_CACHE" "$BOOT_VOLUME_CACHE" "$IMAGE_CACHE" "$CUSTOM_IMAGE_CACHE" "$CAPACITY_TOPOLOGY_CACHE" "$COMPUTE_HOST_CACHE" "$COMPUTE_HOST_IMPACT_CACHE"
             rm -rf "${IC_DETAIL_CACHE_DIR:?}" 2>/dev/null
             echo -e "${GREEN}✓ Compute caches cleared${NC}"
             sleep 1
@@ -56104,7 +56113,7 @@ manage_compute_hosts() {
             local _empty_choice
             read -r _empty_choice
             case "$_empty_choice" in
-                r|R) rm -f "$COMPUTE_HOST_CACHE"; [[ -n "$COMPUTE_HOST_DETAIL_DIR" && "$COMPUTE_HOST_DETAIL_DIR" == */compute_host_detail ]] && rm -rf "$COMPUTE_HOST_DETAIL_DIR" 2>/dev/null; echo -e "${YELLOW}Cache cleared, refreshing...${NC}"; sleep 1; continue ;;
+                r|R) rm -f "$COMPUTE_HOST_CACHE" "$COMPUTE_HOST_IMPACT_CACHE"; [[ -n "$COMPUTE_HOST_DETAIL_DIR" && "$COMPUTE_HOST_DETAIL_DIR" == */compute_host_detail ]] && rm -rf "$COMPUTE_HOST_DETAIL_DIR" 2>/dev/null; echo -e "${YELLOW}Cache cleared, refreshing...${NC}"; sleep 1; continue ;;
                 *) return ;;
             esac
         fi
@@ -56112,21 +56121,43 @@ manage_compute_hosts() {
         #-----------------------------------------------------------------------
         # Fetch impacted host details (individual GET calls) + build lookup
         # Format: host_ocid|maintenanceType|recycleLevel|comp1_type:comp1_action:comp1_faultId:comp1_severity;...
+        # Uses COMPUTE_HOST_IMPACT_CACHE to avoid jq re-extraction on every display.
         #-----------------------------------------------------------------------
         _ch_fetch_impacted_details
         _ch_fetch_k8s_data
         _step_finish
         _display_api_refresh_status "Compute host API data"
 
-        _CH_IMPACT_LOOKUP="${TEMP_DIR}/ch_impact_lookup_$$.txt"
-        : > "$_CH_IMPACT_LOOKUP"
+        _CH_IMPACT_LOOKUP="$COMPUTE_HOST_IMPACT_CACHE"
 
-        # Build lookup from per-host detail cache (compute-host get responses)
-        if [[ -d "$COMPUTE_HOST_DETAIL_DIR" ]]; then
-            for _detail_file in "$COMPUTE_HOST_DETAIL_DIR"/*.json; do
-                [[ -s "$_detail_file" ]] || continue
-                jq -r '.data |
-                    select(.["impacted-component-details"] != null) |
+        # Rebuild impact lookup only if cache is stale or missing
+        if ! is_cache_fresh "$COMPUTE_HOST_IMPACT_CACHE"; then
+            local _imp_tmp=""
+            _imp_tmp=$(create_temp_file) || true
+            : > "$_imp_tmp"
+
+            # Build lookup from per-host detail cache (compute-host get responses)
+            if [[ -d "$COMPUTE_HOST_DETAIL_DIR" ]]; then
+                for _detail_file in "$COMPUTE_HOST_DETAIL_DIR"/*.json; do
+                    [[ -s "$_detail_file" ]] || continue
+                    jq -r '.data |
+                        select(.["impacted-component-details"] != null) |
+                        .id as $hid |
+                        (.["recycle-details"]["recycle-level"] // "N/A") as $rl |
+                        (.["impacted-component-details"]["impactedComponents"]["v1"] // {}) |
+                        (.maintenanceType // "N/A") as $mt |
+                        ([(.components // [])[] |
+                            "\(.componentType // "?"):\(.action // "?"):\(.faultId // "?"):\(.severity // "?")"]
+                        | join(";")) as $comps |
+                        "\($hid)|\($mt)|\($rl)|\($comps)"
+                    ' "$_detail_file" >> "$_imp_tmp" 2>/dev/null || true
+                done
+            fi
+
+            # Fallback: if no detail files, try list JSON cache (may have data in some API versions)
+            if [[ ! -s "$_imp_tmp" && -s "$COMPUTE_HOST_JSON_CACHE" ]]; then
+                jq -r '(.data.items // .data // [])[] |
+                    select(.["has-impacted-components"] == true) |
                     .id as $hid |
                     (.["recycle-details"]["recycle-level"] // "N/A") as $rl |
                     (.["impacted-component-details"]["impactedComponents"]["v1"] // {}) |
@@ -56135,23 +56166,11 @@ manage_compute_hosts() {
                         "\(.componentType // "?"):\(.action // "?"):\(.faultId // "?"):\(.severity // "?")"]
                     | join(";")) as $comps |
                     "\($hid)|\($mt)|\($rl)|\($comps)"
-                ' "$_detail_file" >> "$_CH_IMPACT_LOOKUP" 2>/dev/null || true
-            done
-        fi
+                ' "$COMPUTE_HOST_JSON_CACHE" > "$_imp_tmp" 2>/dev/null || true
+            fi
 
-        # Fallback: if no detail files, try list JSON cache (may have data in some API versions)
-        if [[ ! -s "$_CH_IMPACT_LOOKUP" && -s "$COMPUTE_HOST_JSON_CACHE" ]]; then
-            jq -r '(.data.items // .data // [])[] |
-                select(.["has-impacted-components"] == true) |
-                .id as $hid |
-                (.["recycle-details"]["recycle-level"] // "N/A") as $rl |
-                (.["impacted-component-details"]["impactedComponents"]["v1"] // {}) |
-                (.maintenanceType // "N/A") as $mt |
-                ([(.components // [])[] |
-                    "\(.componentType // "?"):\(.action // "?"):\(.faultId // "?"):\(.severity // "?")"]
-                | join(";")) as $comps |
-                "\($hid)|\($mt)|\($rl)|\($comps)"
-            ' "$COMPUTE_HOST_JSON_CACHE" > "$_CH_IMPACT_LOOKUP" 2>/dev/null || true
+            _cache_write "$COMPUTE_HOST_IMPACT_CACHE" < "$_imp_tmp"
+            rm -f "$_imp_tmp" 2>/dev/null
         fi
 
         #-----------------------------------------------------------------------
@@ -56578,7 +56597,7 @@ manage_compute_hosts() {
                 _ui_json_viewer "Compute Hosts JSON" "-f" "$COMPUTE_HOST_JSON_CACHE" ".data" "${choice#* }"
                 ;;
             r|R)
-                rm -f "$COMPUTE_HOST_CACHE" "$COMPUTE_HOST_JSON_CACHE"
+                rm -f "$COMPUTE_HOST_CACHE" "$COMPUTE_HOST_JSON_CACHE" "$COMPUTE_HOST_IMPACT_CACHE"
                 [[ -n "$COMPUTE_HOST_DETAIL_DIR" && "$COMPUTE_HOST_DETAIL_DIR" == */compute_host_detail ]] && rm -rf "$COMPUTE_HOST_DETAIL_DIR" 2>/dev/null
                 echo -e "${YELLOW}Cache cleared, refreshing...${NC}"
                 sleep 1
