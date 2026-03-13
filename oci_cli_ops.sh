@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.12"
+readonly SCRIPT_VERSION="3.30.13"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9647,12 +9647,26 @@ list_maintenance_events() {
         if [[ -f "$maint_output_temp" ]]; then
             echo ""
             echo -e "${BOLD}By GPU Memory Cluster:${NC}"
+
+            # Pre-build set of clusters with SCHEDULED instance maintenance events
+            declare -A _gc_has_maint=()
+            if [[ -f "$MAINT_EVENTS_CACHE" && -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+                while IFS='|' read -r _gm_inst _gm_cid _gm_cname; do
+                    [[ "$_gm_inst" == "#"* || -z "$_gm_inst" ]] && continue
+                    if jq -e --arg iid "$_gm_inst" '.data[] | select(.["instance-id"] == $iid and .["lifecycle-state"] == "SCHEDULED")' "$MAINT_EVENTS_CACHE" >/dev/null 2>&1; then
+                        _gc_has_maint["$_gm_cname"]=1
+                    fi
+                done < "$INSTANCE_CLUSTER_MAP_CACHE"
+            fi
+
             # Field 12 (0-indexed: 11) is gpu_cluster in the temp file
             cut -d'|' -f12 "$maint_output_temp" 2>/dev/null | sort | uniq -c | sort -rn | while read -r _gc_cnt _gc_name; do
                 [[ -z "$_gc_name" ]] && continue
                 local _gc_label="nodes"
                 [[ "$_gc_cnt" -eq 1 ]] && _gc_label="node"
-                printf "  ${MAGENTA}%-30s${NC} ${WHITE}%s${NC} %s\n" "$_gc_name" "$_gc_cnt" "$_gc_label"
+                local _gc_maint_ind=""
+                [[ -n "${_gc_has_maint[$_gc_name]:-}" ]] && _gc_maint_ind=" ${LIGHT_RED}[I]${NC}"
+                printf "  ${MAGENTA}%-30s${NC} ${WHITE}%s${NC} %s%b\n" "$_gc_name" "$_gc_cnt" "$_gc_label" "$_gc_maint_ind"
             done
         fi
     fi
@@ -10073,7 +10087,7 @@ list_maintenance_events() {
             
             # ── Detail view: full row + fault sub-line + blank line ──
             printf "  "
-            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "-" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$GRAY" "$cap_topo_color" "$GRAY" "$GRAY" "$CYAN"
+            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "-" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$GRAY" "$cap_topo_color" "$GRAY" "$GRAY" "$MAGENTA"
             
             # Display fault/additional details as dim sub-line aligned to main row columns
             # ↳ indented 3 spaces, then:  Fault ID→Instance Name  Component→K8s Node  Sev→Serial
@@ -10138,7 +10152,7 @@ list_maintenance_events() {
             cap_topo_color=$(color_host_health "$evt_cap_topo")
             
             printf "  "
-            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$fault_code_color" "$cap_topo_color" "$GRAY" "$GRAY" "$CYAN"
+            _col_print_row "ME" "$me_idx" "${inst_name:0:30}" "${k8s_node:0:20}" "${k8s_serial:0:14}" "$inst_state" "$k8s_display" "$cordon_display" "${taint_display:0:8}" "$k8s_pods" "${evt_reason:0:22}" "${evt_category:0:12}" "$evt_lifecycle" "${evt_display_name:0:28}" "${window_display:0:28}" "${time_finished_display:0:22}" "$resched_display" "${inst_announcement:0:10}" "${compact_fault_code:0:22}" "$evt_cap_topo" "$evt_id" "$evt_instance_id" "${inst_gpu_cluster_name:0:30}" "$k8s_node_color" "$serial_color" "$state_color" "$k8s_color" "$cordon_color" "$taint_color" "$pods_color" "$reason_color" "$lifecycle_color" "$window_color" "$time_finished_color" "$resched_color" "$ann_color" "$fault_code_color" "$cap_topo_color" "$GRAY" "$GRAY" "$MAGENTA"
         fi
             
     done < <(jq -r '.data[] | "\(.id)|\(.["instance-id"] // "")|\(.["maintenance-reason"] // "N/A")|\(.["maintenance-category"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.["time-window-start"] // "null")|\(.["time-hard-due-date"] // "null")|\(.["can-reschedule"] // false)|\(.["display-name"] // "N/A")|\(.["instance-action"] // "N/A")|\(.["time-finished"] // "null")|\(.["time-created"] // "null")|\(.["additional-details"] // "{}" | @json)"' "$cache_file" 2>/dev/null | sort -t'|' -k6,6)
