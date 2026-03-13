@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.6"
+readonly SCRIPT_VERSION="3.30.7"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -42726,9 +42726,8 @@ _fw_update_fabric_firmware() {
     fi
 
     local -a _fab_names=() _fab_ocids=() _fab_states=() _fab_curfw=() _fab_tarfw=() _fab_fwstates=()
-    local -a _fab_total=() _fab_healthy=() _fab_avail=() _fab_suffix=()
     local _fidx=0
-    while IFS='|' read -r _fn _fsuf _focid _fstate _fhealthy _favail _ftotal _fcurfw _ftarfw _ffwstate _fcreated; do
+    while IFS='|' read -r _fn _fsuf _focid _fstate _fhealthy _favail _ftotal _fcurfw _ftarfw _ffwstate; do
         [[ -z "$_focid" ]] && continue
         ((_fidx++))
         _fab_names+=("$_fn")
@@ -42737,10 +42736,6 @@ _fw_update_fabric_firmware() {
         _fab_curfw+=("$_fcurfw")
         _fab_tarfw+=("$_ftarfw")
         _fab_fwstates+=("$_ffwstate")
-        _fab_total+=("${_ftotal:-0}")
-        _fab_healthy+=("${_fhealthy:-0}")
-        _fab_avail+=("${_favail:-0}")
-        _fab_suffix+=("$_fsuf")
     done < <(grep -v "^#" "$FABRIC_CACHE")
 
     if [[ $_fidx -eq 0 ]]; then
@@ -42749,26 +42744,12 @@ _fw_update_fabric_firmware() {
         return
     fi
 
-    # Build cluster size per fabric suffix from CLUSTER_CACHE (first cluster per suffix)
-    declare -A _fab_cluster_size=()
-    if [[ -f "$CLUSTER_CACHE" ]]; then
-        declare -A _fab_csuf_seen=()
-        while IFS='|' read -r _cc_ocid _cc_name _cc_state _cc_fsuf _cc_ic _cc_cc _cc_size; do
-            [[ -z "$_cc_fsuf" || -n "${_fab_csuf_seen[$_cc_fsuf]:-}" ]] && continue
-            _fab_csuf_seen["$_cc_fsuf"]=1
-            _fab_cluster_size["$_cc_fsuf"]="${_cc_size:-N/A}"
-        done < <(grep -v "^#" "$CLUSTER_CACHE")
-    fi
-
     # Find the latest ACTIVE bundle OCID (last by display-name sort) for upgrade comparison
     local _latest_bundle=""
     _latest_bundle=$(jq -r '[.data.items[] | select(.["lifecycle-state"] == "ACTIVE")] | sort_by(.["display-name"]) | last | .id // ""' <<< "$_fw_json" 2>/dev/null)
 
     echo -e "  ${BOLD}${WHITE}Select GPU Memory Fabric:${NC}"
     echo ""
-    printf "  ${BOLD}    %-30s  %-14s  %5s  %7s  %5s  %12s  %-12s${NC}\n" \
-        "Fabric Name" "State" "Total" "Healthy" "Avail" "Cluster Size" "FW State"
-    print_separator 100
     for _i in "${!_fab_names[@]}"; do
         local _sc="$WHITE"
         case "${_fab_states[$_i]}" in
@@ -42778,25 +42759,26 @@ _fw_update_fabric_firmware() {
             *) _sc="$RED" ;;
         esac
 
-        local _fws_display="${_fab_fwstates[$_i]}"
-        local _fwsc="$GRAY"
-        if [[ "$_fws_display" != "N/A" && -n "$_fws_display" ]]; then
-            _fwsc=$(color_firmware_state "$_fws_display")
+        local _fws_badge=""
+        if [[ "${_fab_fwstates[$_i]}" != "N/A" && -n "${_fab_fwstates[$_i]}" ]]; then
+            local _fwsc
+            _fwsc=$(color_firmware_state "${_fab_fwstates[$_i]}")
+            _fws_badge="  [${_fwsc}${_fab_fwstates[$_i]}${NC}]"
         fi
-
-        # Cluster size from CLUSTER_CACHE
-        local _csz="${_fab_cluster_size[${_fab_suffix[$_i]}]:-N/A}"
 
         # Upgrade available indicator
-        local _upgrade=""
+        local _upgrade_badge=""
         if [[ -n "$_latest_bundle" && "${_fab_curfw[$_i]}" != "$_latest_bundle" && "${_fab_curfw[$_i]}" != "N/A" ]]; then
-            _upgrade=" ${CYAN}↑${NC}"
+            _upgrade_badge="  ${CYAN}↑ upgrade available${NC}"
         fi
 
-        printf "  ${GREEN}%2d${NC}) ${WHITE}%-30s${NC}  ${_sc}%-14s${NC}  %5s  %7s  %5s  %12s  ${_fwsc}%-12s${NC}%b\n" \
-            "$((_i+1))" "${_fab_names[$_i]}" "${_fab_states[$_i]}" \
-            "${_fab_total[$_i]}" "${_fab_healthy[$_i]}" "${_fab_avail[$_i]}" \
-            "$_csz" "$_fws_display" "$_upgrade"
+        local _fw_inline=""
+        if [[ "${_fab_curfw[$_i]}" != "N/A" && -n "${_fab_curfw[$_i]}" ]]; then
+            _fw_inline="  ${YELLOW}${_fab_curfw[$_i]}${NC}"
+        fi
+
+        printf "    ${GREEN}%2d${NC}) ${WHITE}%-30s${NC} ${_sc}%-12s${NC}${_fws_badge}${_fw_inline}${_upgrade_badge}\n" \
+            "$((_i+1))" "${_fab_names[$_i]}" "${_fab_states[$_i]}"
     done
 
     echo ""
@@ -43371,9 +43353,9 @@ update_gpu_memory_cluster_interactive() {
     # List available GPU Memory Clusters
     echo -e "${WHITE}Available GPU Memory Clusters:${NC}"
     echo ""
-    printf "${BOLD}%-6s %-35s %-10s %6s  %-40s %8s %6s %6s${NC}\n" \
-        "ID" "Cluster Name" "State" "Size" "Fabric" "Healthy" "Avail" "Total"
-    print_separator 130
+    printf "  ${BOLD}%-5s  %-35s  %-12s  %-30s  %5s  %7s  %5s  %12s${NC}\n" \
+        "ID" "Cluster Name" "State" "Fabric" "Total" "Healthy" "Avail" "Cluster Size"
+    print_separator 125
     
     # Collect cluster lines for sorting
     local cluster_lines_temp
@@ -43419,13 +43401,13 @@ update_gpu_memory_cluster_interactive() {
         # Color state
         local state_color
         state_color=$(color_resource_state "$c_state")
-        
+
         # Color available - highlight if > 0
         local avail_color="${WHITE}"
         [[ "$f_avail" != "N/A" && "$f_avail" != "0" ]] && avail_color="${LIGHT_GREEN}"
-        
-        printf "${YELLOW}%-6s${NC} ${MAGENTA}%-35s${NC} ${state_color}%-10s${NC} %6s  ${CYAN}%-40s${NC} %8s ${avail_color}%6s${NC} %6s\n" \
-            "$gid" "$c_name" "$c_state" "$c_size" "$fabric_name" "$f_healthy" "$f_avail" "$f_total"
+
+        printf "  ${YELLOW}%-5s${NC}  ${MAGENTA}%-35s${NC}  ${state_color}%-12s${NC}  ${CYAN}%-30s${NC}  %5s  %7s  ${avail_color}%5s${NC}  %12s\n" \
+            "$gid" "$c_name" "$c_state" "$fabric_name" "$f_total" "$f_healthy" "$f_avail" "$c_size"
     done
     
     rm -f "$cluster_lines_temp"
