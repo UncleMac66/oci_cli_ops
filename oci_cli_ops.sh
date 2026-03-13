@@ -13563,7 +13563,7 @@ display_gpu_management_menu() {
                     # Check if this cluster has degraded/unhealthy compute hosts (from pre-computed map)
                     local _cl_maint_badge=""
                     local _cl_degraded_count="${_cl_degraded_map[$cluster_name]:-0}"
-                    [[ $_cl_degraded_count -gt 0 ]] && _cl_maint_badge="  ${LIGHT_RED}[Degraded: ${_cl_degraded_count}]${NC}"
+                    [[ $_cl_degraded_count -gt 0 ]] && _cl_maint_badge="${LIGHT_RED}[Degraded: ${_cl_degraded_count}]${NC}"
 
                     # Cluster line: ID, Name [Degraded: N], State, Created, Age, Size(under Total), OCID
                     # Prefix: 3(indent)+2(tree)+1(sp)+4(gid)+1(sp) = 11 visible chars before name
@@ -13575,7 +13575,7 @@ display_gpu_management_menu() {
                         [[ $_cl_to_badge -lt 1 ]] && _cl_to_badge=1
                         printf "%${_cl_to_badge}s" ""
                         printf "${_cl_maint_badge}"
-                        local _cl_badge_len=$(( 2 + ${#_cl_degraded_count} + 12 ))  # "  [Degraded: ]" visible
+                        local _cl_badge_len=$(( ${#_cl_degraded_count} + 12 ))  # "[Degraded: ]" visible
                         local _cl_badge_end=$(( 31 + _cl_badge_len ))
                         local _cl_to_state=$(( 78 - _cl_badge_end ))
                         [[ $_cl_to_state -lt 1 ]] && _cl_to_state=1
