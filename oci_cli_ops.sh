@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.11"
+readonly SCRIPT_VERSION="3.30.12"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9545,9 +9545,9 @@ list_maintenance_events() {
     echo -e "${GRAY}Showing instances with: unhealthy compute host health state${NC}"
     echo ""
 
-    printf "${BOLD}%-4s %-26s %-10s %-20s %-8s %-6s %-5s %-10s %-14s %-16s %-20s %s${NC}\n" \
-        "ID" "Display Name" "OCI State" "K8s Node" "Ready" "Cordon" "Pods" "CompHost" "Serial Number" "Announcement" "Shape" "Instance OCID"
-    print_separator 240
+    printf "${BOLD}%-4s %-26s %-10s %-20s %-8s %-6s %-5s %-10s %-14s %-16s %-20s %-22s %s${NC}\n" \
+        "ID" "Display Name" "OCI State" "K8s Node" "Ready" "Cordon" "Pods" "CompHost" "Serial Number" "Announcement" "Shape" "GPU Cluster" "Instance OCID"
+    print_separator 260
     
     local maint_inst_count=0
     local maint_output_temp
@@ -9593,7 +9593,8 @@ list_maintenance_events() {
             fi
         fi
         
-        echo "${mi_sort_ann}|${mi_cap_topo}|${mi_ann}|${mi_name}|${mi_state}|${mi_k8s_node}|${mi_k8s_ready}|${mi_k8s_cordon}|${mi_k8s_pods}|${mi_k8s_serial}|${mi_shape}|${mi_ocid}" >> "$maint_output_temp"
+        local mi_gpu_cluster="${_ME_GPU_CLUSTER[$mi_ocid]:-N/A}"
+        echo "${mi_sort_ann}|${mi_cap_topo}|${mi_ann}|${mi_name}|${mi_state}|${mi_k8s_node}|${mi_k8s_ready}|${mi_k8s_cordon}|${mi_k8s_pods}|${mi_k8s_serial}|${mi_shape}|${mi_gpu_cluster}|${mi_ocid}" >> "$maint_output_temp"
     done < "$me_inst_temp"
     
     # Build instance map and display sorted table
@@ -9601,12 +9602,12 @@ list_maintenance_events() {
     rm -f "${TEMP_DIR}/maint_map_$$"
     local maint_inst_idx=0
     
-    sort -t'|' -k1,1 -k2,2r "$maint_output_temp" 2>/dev/null | while IFS='|' read -r sort_key mi_cap mi_ann mi_dn mi_oci_st mi_k8s_nd mi_k8s_rdy mi_k8s_crd mi_k8s_pds mi_k8s_ser mi_shp mi_ocid; do
+    sort -t'|' -k1,1 -k2,2r "$maint_output_temp" 2>/dev/null | while IFS='|' read -r sort_key mi_cap mi_ann mi_dn mi_oci_st mi_k8s_nd mi_k8s_rdy mi_k8s_crd mi_k8s_pds mi_k8s_ser mi_shp mi_gpu_cl mi_ocid; do
         [[ -z "$mi_ocid" ]] && continue
         ((maint_inst_idx++))
-        
-        echo "m${maint_inst_idx}|${mi_ocid}|${mi_k8s_nd}|${mi_dn}|${mi_k8s_crd}" >> "${TEMP_DIR}/maint_map_$$"
-        
+
+        echo "m${maint_inst_idx}|${mi_ocid}|${mi_k8s_nd}|${mi_dn}|${mi_k8s_crd}|${mi_gpu_cl}" >> "${TEMP_DIR}/maint_map_$$"
+
         local mi_oci_color="$GREEN"
         mi_oci_color=$(color_oci_state "$mi_oci_st")
         local mi_rdy_color="$GREEN"
@@ -9622,14 +9623,14 @@ list_maintenance_events() {
         [[ "$mi_ann" != "-" && -n "$mi_ann" ]] && mi_ann_color="$YELLOW"
         local mi_ser_color="$GRAY"
         [[ "$mi_k8s_ser" != "N/A" && -n "$mi_k8s_ser" ]] && mi_ser_color="$CYAN"
-        
-        printf "${YELLOW}%-4s${NC} %-26s ${mi_oci_color}%-10s${NC} %-20s ${mi_rdy_color}%-8s${NC} ${mi_crd_color}%-6s${NC} ${mi_pds_color}%-5s${NC} ${mi_cap_color}%-10s${NC} ${mi_ser_color}%-14s${NC} ${mi_ann_color}%-16s${NC} %-20s ${GRAY}%s${NC}\n" \
-            "m${maint_inst_idx}" "${mi_dn:0:26}" "$mi_oci_st" "${mi_k8s_nd:0:20}" "$mi_k8s_rdy" "$mi_k8s_crd" "$mi_k8s_pds" "$mi_cap" "${mi_k8s_ser:0:14}" "${mi_ann:0:16}" "${mi_shp:0:20}" "$mi_ocid"
+
+        printf "${YELLOW}%-4s${NC} %-26s ${mi_oci_color}%-10s${NC} %-20s ${mi_rdy_color}%-8s${NC} ${mi_crd_color}%-6s${NC} ${mi_pds_color}%-5s${NC} ${mi_cap_color}%-10s${NC} ${mi_ser_color}%-14s${NC} ${mi_ann_color}%-16s${NC} %-20s ${MAGENTA}%-22s${NC} ${GRAY}%s${NC}\n" \
+            "m${maint_inst_idx}" "${mi_dn:0:26}" "$mi_oci_st" "${mi_k8s_nd:0:20}" "$mi_k8s_rdy" "$mi_k8s_crd" "$mi_k8s_pds" "$mi_cap" "${mi_k8s_ser:0:14}" "${mi_ann:0:16}" "${mi_shp:0:20}" "${mi_gpu_cl:0:22}" "$mi_ocid"
     done
     
     # Read instance map from temp file (subshell workaround)
     if [[ -f "${TEMP_DIR}/maint_map_$$" ]]; then
-        while IFS='|' read -r midx mocid mk8s_node mdn mcordon; do
+        while IFS='|' read -r midx mocid mk8s_node mdn mcordon mgpu_cl; do
             MAINT_INSTANCE_MAP[$midx]="${mocid}|${mk8s_node}|${mdn}|${mcordon}"
         done < "${TEMP_DIR}/maint_map_$$"
         maint_inst_count=$(wc -l < "${TEMP_DIR}/maint_map_$$")
@@ -9641,6 +9642,19 @@ list_maintenance_events() {
         echo -e "${GREEN}✓ No instances require maintenance attention${NC}"
     else
         echo -e "${YELLOW}Found ${WHITE}${maint_inst_count}${YELLOW} instance(s) requiring attention${NC}"
+
+        # Summary by GPU Memory Cluster
+        if [[ -f "$maint_output_temp" ]]; then
+            echo ""
+            echo -e "${BOLD}By GPU Memory Cluster:${NC}"
+            # Field 12 (0-indexed: 11) is gpu_cluster in the temp file
+            cut -d'|' -f12 "$maint_output_temp" 2>/dev/null | sort | uniq -c | sort -rn | while read -r _gc_cnt _gc_name; do
+                [[ -z "$_gc_name" ]] && continue
+                local _gc_label="nodes"
+                [[ "$_gc_cnt" -eq 1 ]] && _gc_label="node"
+                printf "  ${MAGENTA}%-30s${NC} ${WHITE}%s${NC} %s\n" "$_gc_name" "$_gc_cnt" "$_gc_label"
+            done
+        fi
     fi
     
     # Instance maintenance details section (announcements linked to events — only when enabled)
@@ -13493,21 +13507,23 @@ display_gpu_management_menu() {
                     _cl_date=$(_date_short "${cluster_created:-}")
                     _cl_age=$(_days_since "${cluster_created:-}")
 
-                    # Check if this cluster has maintenance events
+                    # Check if this cluster has degraded/unhealthy compute hosts (from c10 data)
                     local _cl_maint_badge=""
-                    if [[ -f "$MAINT_EVENTS_CACHE" && -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
-                        local _cl_maint_count=0
+                    if [[ -f "$COMPUTE_HOST_CACHE" && -f "$INSTANCE_CLUSTER_MAP_CACHE" ]]; then
+                        local _cl_degraded_count=0
                         while IFS='|' read -r _mc_inst _mc_cid _mc_cname; do
                             [[ "$_mc_cname" == "$cluster_name" ]] || continue
-                            # Count only SCHEDULED maintenance events (matches o3 display)
-                            if jq -e --arg iid "$_mc_inst" '.data[] | select(.["instance-id"] == $iid and .["lifecycle-state"] == "SCHEDULED")' "$MAINT_EVENTS_CACHE" >/dev/null 2>&1; then
-                                ((_cl_maint_count++))
+                            # Check if this instance's compute host has non-HEALTHY health
+                            local _mc_host_health=""
+                            _mc_host_health=$(grep -F "$_mc_inst" "$COMPUTE_HOST_CACHE" 2>/dev/null | head -1 | cut -d'|' -f3)
+                            if [[ -n "$_mc_host_health" && "$_mc_host_health" != "HEALTHY" ]]; then
+                                ((_cl_degraded_count++))
                             fi
                         done < "$INSTANCE_CLUSTER_MAP_CACHE"
-                        [[ $_cl_maint_count -gt 0 ]] && _cl_maint_badge="  ${LIGHT_RED}[Maintenances: ${_cl_maint_count}]${NC}"
+                        [[ $_cl_degraded_count -gt 0 ]] && _cl_maint_badge="  ${LIGHT_RED}[Degraded: ${_cl_degraded_count}]${NC}"
                     fi
 
-                    # Cluster line: ID, Name, then at col 66: [Maintenances] or State, Created, Age, Size(under Total), OCID
+                    # Cluster line: ID, Name, then at col 66: [Degraded] or State, Created, Age, Size(under Total), OCID
                     # Prefix: 3(indent)+3(tree)+1(sp)+4(gid)+1(sp) = 12 visible chars before name
                     if [[ -n "$_cl_maint_badge" ]]; then
                         printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}" "$gid" "$cluster_name"
