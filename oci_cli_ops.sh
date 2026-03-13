@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.4"
+readonly SCRIPT_VERSION="3.30.5"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -56070,7 +56070,8 @@ manage_compute_hosts() {
             --cmd "oci compute compute-host list --compartment-id \$TENANCY_ID --region \$REGION --all" \
             --env \
             --cache \
-            "${COMPUTE_HOST_CACHE}|Compute Hosts"
+            "${COMPUTE_HOST_CACHE}|Compute Hosts" \
+            "${COMPUTE_HOST_IMPACT_CACHE}|Impacted Details"
 
         if [[ -z "$tenancy_id" ]]; then
             echo -e "${RED}TENANCY_ID not set. Cannot query compute hosts.${NC}"
@@ -56123,7 +56124,11 @@ manage_compute_hosts() {
         # Format: host_ocid|maintenanceType|recycleLevel|comp1_type:comp1_action:comp1_faultId:comp1_severity;...
         # Uses COMPUTE_HOST_IMPACT_CACHE to avoid jq re-extraction on every display.
         #-----------------------------------------------------------------------
-        _ch_fetch_impacted_details
+        if is_cache_fresh "$COMPUTE_HOST_IMPACT_CACHE"; then
+            _step_complete "impacted details(cached)"
+        else
+            _ch_fetch_impacted_details
+        fi
         _ch_fetch_k8s_data
         _step_finish
         _display_api_refresh_status "Compute host API data"
