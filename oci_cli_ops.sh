@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.7"
+readonly SCRIPT_VERSION="3.30.8"
 readonly SCRIPT_VERSION_DATE="2026-03-12"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -10232,12 +10232,35 @@ list_maintenance_events() {
         fi
     fi
 
-    # ── By GPU Fabric (grouped by month) ──
+    # ── By GPU Memory Cluster ──
     if [[ ${#_me_cluster_counts[@]} -gt 0 ]]; then
         echo ""
-        echo -e "  ${BOLD}${WHITE}By GPU Fabric:${NC}"
-        printf "  ${BOLD}${WHITE}%-10s %-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "Month" "Fabric" "Fault Code" "Nodes" "SCHED" "PASS" "CANCEL" "FAIL"
-        printf "  ${GRAY}%-10s %-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "----------------" "--------------------" "------" "-------" "-------" "-------" "-------"
+        echo -e "  ${BOLD}${WHITE}By GPU Memory Cluster:${NC}"
+
+        # Simple cluster → node count summary
+        printf "  ${BOLD}${WHITE}%-30s %6s %7s %7s %7s %7s${NC}\n" "Cluster" "Nodes" "SCHED" "PASS" "CANCEL" "FAIL"
+        printf "  ${GRAY}%-30s %6s %7s %7s %7s %7s${NC}\n" "------------------------------" "------" "-------" "-------" "-------" "-------"
+        local _gc_key
+        while IFS= read -r _gc_key; do
+            [[ -z "$_gc_key" ]] && continue
+            local _gc_n="${_me_cluster_counts[$_gc_key]}"
+            local _gc_s="${_me_cluster_lc_counts["${_gc_key}|SCHEDULED"]:-0}"
+            local _gc_p="${_me_cluster_lc_counts["${_gc_key}|SUCCEEDED"]:-0}"
+            local _gc_c="${_me_cluster_lc_counts["${_gc_key}|CANCELED"]:-0}"
+            local _gc_f="${_me_cluster_lc_counts["${_gc_key}|FAILED"]:-0}"
+            _me_lc_fmt "$_gc_s" S; local _gcs="$_lf_c" _gcsv="$_lf_v"
+            _me_lc_fmt "$_gc_p" P; local _gcp="$_lf_c" _gcpv="$_lf_v"
+            _me_lc_fmt "$_gc_c" C; local _gcc="$_lf_c" _gccv="$_lf_v"
+            _me_lc_fmt "$_gc_f" F; local _gcf="$_lf_c" _gcfv="$_lf_v"
+            printf "  ${MAGENTA}%-30s${NC} ${WHITE}%6d${NC} ${_gcs}%7s${NC} ${_gcp}%7s${NC} ${_gcc}%7s${NC} ${_gcf}%7s${NC}\n" \
+                "$_gc_key" "$_gc_n" "$_gcsv" "$_gcpv" "$_gccv" "$_gcfv"
+        done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
+        echo ""
+
+        # Detailed breakdown: cluster × fault code (grouped by month)
+        echo -e "  ${BOLD}${WHITE}By GPU Memory Cluster / Fault Code:${NC}"
+        printf "  ${BOLD}${WHITE}%-10s %-25s %-20s %6s %7s %7s %7s %7s${NC}\n" "Month" "Cluster" "Fault Code" "Nodes" "SCHED" "PASS" "CANCEL" "FAIL"
+        printf "  ${GRAY}%-10s %-25s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "-------------------------" "--------------------" "------" "-------" "-------" "-------" "-------"
 
         local _gt_n=0 _gt_s=0 _gt_p=0 _gt_c=0 _gt_f=0 _gt_fabs=0
         for _month in "${_me_sorted_months[@]}"; do
@@ -10264,7 +10287,7 @@ list_maintenance_events() {
                     _me_lc_fmt "$_mcf_p" P; local _pc="$_lf_c" _pv="$_lf_v"
                     _me_lc_fmt "$_mcf_c" C; local _cc="$_lf_c" _cv="$_lf_v"
                     _me_lc_fmt "$_mcf_f" F; local _fcc="$_lf_c" _fv="$_lf_v"
-                    printf "  ${WHITE}%-10s${NC} ${MAGENTA}%-16s${NC} ${CYAN}%-20s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
+                    printf "  ${WHITE}%-10s${NC} ${MAGENTA}%-25s${NC} ${CYAN}%-20s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
                         "$_ml" "$_fl" "$_cf_fault" "$_mcf_n" "$_sv" "$_pv" "$_cv" "$_fv"
                     (( _gt_n += _mcf_n )); (( _gt_s += _mcf_s )); (( _gt_p += _mcf_p ))
                     (( _gt_c += _mcf_c )); (( _gt_f += _mcf_f ))
@@ -10272,12 +10295,12 @@ list_maintenance_events() {
             done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
         done
 
-        # Count unique fabrics
+        # Count unique clusters
         _gt_fabs=$(printf '%s\n' "${!_me_cluster_counts[@]}" | wc -l)
 
-        # Totals by fabric/fault code (across months)
-        printf "  ${GRAY}%-10s %-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "----------------" "--------------------" "------" "-------" "-------" "-------" "-------"
-        echo -e "  ${BOLD}${WHITE}Totals by Fabric/Fault Code:${NC}"
+        # Totals by cluster/fault code (across months)
+        printf "  ${GRAY}%-10s %-25s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "-------------------------" "--------------------" "------" "-------" "-------" "-------" "-------"
+        echo -e "  ${BOLD}${WHITE}Totals by Cluster/Fault Code:${NC}"
         local _gc_key
         while IFS= read -r _gc_key; do
             [[ -z "$_gc_key" ]] && continue
@@ -10298,16 +10321,16 @@ list_maintenance_events() {
                 _me_lc_fmt "$_tcf_p" P; local _pc="$_lf_c" _pv="$_lf_v"
                 _me_lc_fmt "$_tcf_c" C; local _cc="$_lf_c" _cv="$_lf_v"
                 _me_lc_fmt "$_tcf_f" F; local _fcc="$_lf_c" _fv="$_lf_v"
-                printf "  ${WHITE}%-10s${NC} ${MAGENTA}%-16s${NC} ${CYAN}%-20s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
+                printf "  ${WHITE}%-10s${NC} ${MAGENTA}%-25s${NC} ${CYAN}%-20s${NC} ${WHITE}%6d${NC} ${_sc}%7s${NC} ${_pc}%7s${NC} ${_cc}%7s${NC} ${_fcc}%7s${NC}\n" \
                     "" "$_fl" "$_cf_fault" "$_tcf_n" "$_sv" "$_pv" "$_cv" "$_fv"
             done < <(printf '%s\n' "${!_me_cluster_fault_counts[@]}" | sort)
         done < <(printf '%s\n' "${!_me_cluster_counts[@]}" | sort)
-        printf "  ${GRAY}%-10s %-16s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "----------------" "--------------------" "------" "-------" "-------" "-------" "-------"
+        printf "  ${GRAY}%-10s %-25s %-20s %6s %7s %7s %7s %7s${NC}\n" "----------" "-------------------------" "--------------------" "------" "-------" "-------" "-------" "-------"
         _me_lc_fmt "$_gt_s" S; local _gts="$_lf_c" _gtsv="$_lf_v"
         _me_lc_fmt "$_gt_p" P; local _gtp="$_lf_c" _gtpv="$_lf_v"
         _me_lc_fmt "$_gt_c" C; local _gtc="$_lf_c" _gtcv="$_lf_v"
         _me_lc_fmt "$_gt_f" F; local _gtf="$_lf_c" _gtfv="$_lf_v"
-        printf "  ${BOLD}${WHITE}%-10s %-16s %-20s %6d${NC} ${_gts}%7s${NC} ${_gtp}%7s${NC} ${_gtc}%7s${NC} ${_gtf}%7s${NC}  ${GRAY}%s fabric(s)${NC}\n" \
+        printf "  ${BOLD}${WHITE}%-10s %-25s %-20s %6d${NC} ${_gts}%7s${NC} ${_gtp}%7s${NC} ${_gtc}%7s${NC} ${_gtf}%7s${NC}  ${GRAY}%s cluster(s)${NC}\n" \
             "" "" "Total" "$_gt_n" "$_gtsv" "$_gtpv" "$_gtcv" "$_gtfv" "$_gt_fabs"
     fi
 
@@ -32277,13 +32300,13 @@ _ANN_ENABLED_INDICES=()
 _ME_COL_CONF="$ME_COLUMNS_CONF"
 _ME_COL_KEYS=(           "id"     "inst_name"  "k8s_node"   "serial"     "state"    "k8s"    "cordon"  "taints"  "pods"   "reason"     "category"   "lifecycle"  "event_name"  "window"     "finished"     "resched" "announce"  "fault_code"  "comp_host"  "evt_ocid"     "inst_ocid"    "gpu_cluster"  )
 _ME_COL_LABELS=(         "#"      "Instance Name" "K8s Node" "Serial"   "State"    "K8s"    "Crdn"    "Taints"  "Pods"   "Maint Reason" "Category" "Lifecycle"  "Event Name"  "Window Start" "Time Finished" "Re"   "Announce"  "Fault Code"  "CompHost"   "Event OCID"   "Instance OCID" "GPU Cluster"  )
-_ME_COL_DEFAULT_WIDTHS=( 4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             9              )
-_ME_COL_WIDTHS=(         4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             9              )
+_ME_COL_DEFAULT_WIDTHS=( 4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             25             )
+_ME_COL_WIDTHS=(         4        20           15           15           10         8        6         8         5        15           12           11           18            20           20             4         10          22            10           75             45             25             )
 _ME_COL_ALIGN=(          "-"      "-"          "-"          "-"          "-"        "-"      "-"       "-"       "-"      "-"          "-"          "-"          "-"           "-"          "-"            "-"       "-"         "-"           "-"          "-"            "-"            "-"            )
 _ME_COL_FMTS=(           "%-4.4s" "%-25.25s"   "%-20.20s"   "%-14.14s"   "%-10.10s" "%-8.8s" "%-6.6s"  "%-8.8s"  "%-5.5s" "%-22.22s"   "%-12.12s"   "%-11.11s"   "%-28.28s"    "%-20.20s"   "%-20.20s"     "%-4.4s"  "%-10.10s"  "%-22.22s"    "%-10.10s"   "%-45.45s"     "%-45.45s"     "%-30.30s"     )
 _ME_COL_COLORS=(         "YELLOW" ""           "@1"         "@2"         "@3"       "@4"     "@5"      "@6"      "@7"     "@8"         ""           "@9"         ""            "@10"        "@11"          "@12"     "@13"       "@14"         "@15"        "@16"          "@17"          "@18"          )
 _ME_COL_LOCKED=( "id" )
-_ME_COL_DEFAULTS=( "id" "inst_name" "k8s_node" "serial" "state" "k8s" "cordon" "taints" "pods" "reason" "lifecycle" "event_name" "window" "finished" "resched" "fault_code" "comp_host" )
+_ME_COL_DEFAULTS=( "id" "inst_name" "k8s_node" "serial" "state" "k8s" "cordon" "taints" "pods" "reason" "lifecycle" "event_name" "window" "finished" "resched" "fault_code" "comp_host" "gpu_cluster" )
 
 # Format globals — ME (Maintenance Events)
 _ME_ENABLED_COLS=()
