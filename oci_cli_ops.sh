@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.15"
+readonly SCRIPT_VERSION="3.30.17"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13380,10 +13380,15 @@ display_gpu_management_menu() {
     local cluster_idx=0
     local summary_healthy=0 summary_avail=0 summary_total=0 summary_clusters=0 summary_cluster_nodes=0
 
-    # Pre-compute latest active firmware bundle OCID (used for upgrade indicator)
-    local _fw_latest_bundle_id=""
+    # Pre-compute firmware bundle upgrade data (used for per-fabric upgrade indicator)
+    # Build a map of bundle OCID → time-created, and find the newest ACTIVE bundle's time-created
+    local _fw_bundle_json=""
+    local _fw_newest_created=""
     if [[ -f "$FW_BUNDLE_CACHE" ]]; then
-        _fw_latest_bundle_id=$(_fw_bundle_cache_read 2>/dev/null | jq -r '[.data.items[] | select(.["lifecycle-state"] == "ACTIVE")] | sort_by(.["display-name"]) | last | .id // ""' 2>/dev/null)
+        _fw_bundle_json=$(_fw_bundle_cache_read 2>/dev/null || true)
+        if [[ -n "$_fw_bundle_json" ]]; then
+            _fw_newest_created=$(jq -r '[.data.items[] | select(.["lifecycle-state"] == "ACTIVE")] | sort_by(.["time-created"]) | last | .["time-created"] // ""' <<< "$_fw_bundle_json" 2>/dev/null)
+        fi
     fi
 
     if [[ -f "$FABRIC_CACHE" ]]; then
@@ -13447,24 +13452,33 @@ display_gpu_management_menu() {
                 if [[ "$current_fw" != "N/A" && "$target_fw" != "N/A" && -n "$current_fw" && -n "$target_fw" && "$current_fw" != "$target_fw" ]]; then
                     _fw_tar_color="$RED"
                 fi
-                # Check for firmware upgrade available (uses pre-computed latest bundle)
+                # Check for firmware upgrade available — compare time-created of current bundle vs newest
                 local _fw_upgrade=""
-                if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
-                    _fw_upgrade=" ${CYAN}↑${NC}"
+                if [[ -n "$_fw_newest_created" && -n "$_fw_bundle_json" && "$current_fw" != "N/A" && -n "$current_fw" ]]; then
+                    local _fw_cur_created=""
+                    _fw_cur_created=$(jq -r --arg cid "$current_fw" '.data.items[] | select(.id == $cid) | .["time-created"] // ""' <<< "$_fw_bundle_json" 2>/dev/null)
+                    # Only show upgrade if newest bundle was created AFTER current bundle
+                    if [[ -n "$_fw_cur_created" && "$_fw_newest_created" > "$_fw_cur_created" ]]; then
+                        _fw_upgrade=" ${CYAN}↑${NC}"
+                    fi
                 fi
-                # Firmware: [BADGE] [↑ FW Update Avail]  pad to cur:/tgt: position
-                # "   ├─ " = 6 visible, "Firmware: " = 10, badge = variable, upgrade badge = 20
-                local _fw_content="Firmware: ${_fw_badge_text}"
-                local _fw_prefix_len=$(( 6 + ${#_fw_content} ))
-                if [[ -n "$_fw_upgrade" ]]; then
-                    _fw_upgrade=" ${WHITE}[↑ FW Update Avail]${NC}"
-                    ((_fw_prefix_len += 20))
-                fi
-                local _fw_pad=$(( 66 - _fw_prefix_len ))
-                [[ $_fw_pad -lt 2 ]] && _fw_pad=2
+                # Firmware: [BADGE]  pad to col 40  [↑ FW Update Avail]  pad to col 78  cur:(13)  tgt:(col 91)
+                local _fw_content_len=$(( 6 + 10 + ${#_fw_badge_text} ))  # prefix + "Firmware: " + badge
                 local _fw_tree="├─"
-                printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
-                    "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
+                if [[ -n "$_fw_upgrade" ]]; then
+                    local _fw_badge_pad=$(( 40 - _fw_content_len ))
+                    [[ $_fw_badge_pad -lt 1 ]] && _fw_badge_pad=1
+                    _fw_upgrade="${WHITE}[↑ FW Update Avail]${NC}"
+                    local _fw_after_badge=$(( 78 - 40 - 19 ))  # 19 = visible len of [↑ FW Update Avail]
+                    [[ $_fw_after_badge -lt 1 ]] && _fw_after_badge=1
+                    printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}%${_fw_badge_pad}s${_fw_upgrade}%${_fw_after_badge}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                        "" "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
+                else
+                    local _fw_pad=$(( 78 - _fw_content_len ))
+                    [[ $_fw_pad -lt 2 ]] && _fw_pad=2
+                    printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                        "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
+                fi
             fi
 
             # Find and display clusters for this fabric
@@ -13541,17 +13555,22 @@ display_gpu_management_menu() {
                     # Cluster line: ID, Name [Degraded: N], State, Created, Age, Size(under Total), OCID
                     # Prefix: 3(indent)+3(tree)+1(sp)+4(gid)+1(sp) = 12 visible chars before name
                     if [[ -n "$_cl_maint_badge" ]]; then
-                        # Badge right after name, then pad to State column at col 66
-                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}${_cl_maint_badge}" "$gid" "$cluster_name"
-                        local _cl_vis_len=$(( 12 + ${#cluster_name} + 2 + ${#_cl_degraded_count} + 12 ))  # "  [Degraded: ]" = 14 visible + count
-                        local _cl_pad=$(( 66 - _cl_vis_len ))
-                        [[ $_cl_pad -lt 2 ]] && _cl_pad=2
-                        printf "%${_cl_pad}s" ""
+                        # Pad name to col 40 (aligns with firmware badge), then badge, then pad to col 78 for State
+                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}" "$gid" "$cluster_name"
+                        local _cl_name_end=$(( 12 + ${#cluster_name} ))
+                        local _cl_to_badge=$(( 40 - _cl_name_end ))
+                        [[ $_cl_to_badge -lt 1 ]] && _cl_to_badge=1
+                        printf "%${_cl_to_badge}s" ""
+                        printf "${_cl_maint_badge}"
+                        local _cl_badge_len=$(( 2 + ${#_cl_degraded_count} + 12 ))  # "  [Degraded: ]" visible
+                        local _cl_to_state=$(( 78 - 40 - _cl_badge_len ))
+                        [[ $_cl_to_state -lt 1 ]] && _cl_to_state=1
+                        printf "%${_cl_to_state}s" ""
                         printf "${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
                             "$cluster_state" "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
                     else
-                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-52s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
-                            "$gid" "$cluster_name" "$cluster_state" "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
+                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-52s${NC}  ${state_color}%-12s${NC}%13s${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
+                            "$gid" "$cluster_name" "$cluster_state" "" "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
                     fi
 
                     # Get compute cluster state and created date from cache
@@ -13594,15 +13613,15 @@ display_gpu_management_menu() {
                         # Use └─ if instance config is hidden (this is the last sub-line)
                         local _cc_tree="├─"
                         [[ "$_C4_SHOW_IC" != "true" ]] && _cc_tree="└─"
-                        printf "${_sub_pfx}${WHITE}${_cc_tree}${NC} ${GRAY}%-18s${NC}${BLUE}%-33s${NC}  ${_cc_state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
-                            "Compute Cluster: " "${cc_name:0:33}" "${_cc_state:-}" "$_cc_date" "$_cc_age"
+                        printf "${_sub_pfx}${WHITE}${_cc_tree}${NC} ${GRAY}%-18s${NC}${BLUE}%-33s${NC}  ${_cc_state_color}%-12s${NC}%13s${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
+                            "Compute Cluster: " "${cc_name:0:33}" "${_cc_state:-}" "" "$_cc_date" "$_cc_age"
                     fi
 
                     if [[ "$_C4_SHOW_IC" == "true" ]]; then
-                        # Align Created with CC line: target absolute col 79
-                        # prefix(10) + tree(3) + label(18) + name + pad = 79
+                        # Align Created on same line — target col 91 (79+12) to fit long IC names
+                        # prefix(10) + tree(3) + label(18) + name + pad = 91
                         local _ic_total=$(( 31 + ${#ic_name} ))
-                        local _ic_pad=$(( 79 - _ic_total ))
+                        local _ic_pad=$(( 91 - _ic_total ))
                         (( _ic_pad < 2 )) && _ic_pad=2
                         printf "${_sub_pfx}${WHITE}└─${NC} ${GRAY}%-18s${NC}${GREEN}%s${NC}%*s${WHITE}%-10s${NC} ${GRAY}%-6s${NC}\n" \
                             "Instance Config: " "$ic_name" "$_ic_pad" "" "$_ic_date" "$_ic_age"
