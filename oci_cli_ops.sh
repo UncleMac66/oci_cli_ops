@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.13"
+readonly SCRIPT_VERSION="3.30.14"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -13452,17 +13452,18 @@ display_gpu_management_menu() {
                 if [[ -n "$_fw_latest_bundle_id" && "$current_fw" != "N/A" && -n "$current_fw" && "$_fw_latest_bundle_id" != "$current_fw" ]]; then
                     _fw_upgrade=" ${CYAN}↑${NC}"
                 fi
-                # Firmware: [BADGE]  pad to col 66  [↑ FW Update Avail]  cur:  tgt:
-                # "   ├─ " = 6 visible, "Firmware: " = 10, badge = variable
-                local _fw_label="Firmware: ${_fw_badge_text}"
-                local _fw_prefix_len=$(( 6 + ${#_fw_label} ))
+                # Firmware: [BADGE] [↑ FW Update Avail]  pad to cur:/tgt: position
+                # "   ├─ " = 6 visible, "Firmware: " = 10, badge = variable, upgrade badge = 20
+                local _fw_content="Firmware: ${_fw_badge_text}"
+                local _fw_prefix_len=$(( 6 + ${#_fw_content} ))
+                if [[ -n "$_fw_upgrade" ]]; then
+                    _fw_upgrade=" ${WHITE}[↑ FW Update Avail]${NC}"
+                    ((_fw_prefix_len += 20))
+                fi
                 local _fw_pad=$(( 66 - _fw_prefix_len ))
                 [[ $_fw_pad -lt 2 ]] && _fw_pad=2
-                if [[ -n "$_fw_upgrade" ]]; then
-                    _fw_upgrade="${WHITE}[↑ FW Update Avail]${NC}  "
-                fi
                 local _fw_tree="├─"
-                printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}%${_fw_pad}s${_fw_upgrade}${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
+                printf "   ${WHITE}${_fw_tree}${NC} ${BOLD}${ORANGE}Firmware:${NC} ${_fw_badge_color}${_fw_badge_text}${NC}${_fw_upgrade}%${_fw_pad}s${YELLOW}%-13s${NC}${_fw_tar_color}%s${NC}\n" \
                     "" "cur:$_fw_cur_short" "tgt:$_fw_tar_short"
             fi
 
@@ -13537,17 +13538,17 @@ display_gpu_management_menu() {
                         [[ $_cl_degraded_count -gt 0 ]] && _cl_maint_badge="  ${LIGHT_RED}[Degraded: ${_cl_degraded_count}]${NC}"
                     fi
 
-                    # Cluster line: ID, Name, then at col 66: [Degraded] or State, Created, Age, Size(under Total), OCID
+                    # Cluster line: ID, Name [Degraded: N], State, Created, Age, Size(under Total), OCID
                     # Prefix: 3(indent)+3(tree)+1(sp)+4(gid)+1(sp) = 12 visible chars before name
                     if [[ -n "$_cl_maint_badge" ]]; then
-                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}" "$gid" "$cluster_name"
-                        # Pad name to col 66 (State column) for badge alignment with firmware [↑ FW Update Avail]
-                        local _cl_name_end=$(( 12 + ${#cluster_name} ))
-                        local _cl_name_pad=$(( 66 - _cl_name_end ))
-                        [[ $_cl_name_pad -lt 2 ]] && _cl_name_pad=2
-                        printf "%${_cl_name_pad}s${_cl_maint_badge}  " ""
-                        printf "${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
-                            "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
+                        # Badge right after name, then pad to State column at col 66
+                        printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%s${NC}${_cl_maint_badge}" "$gid" "$cluster_name"
+                        local _cl_vis_len=$(( 12 + ${#cluster_name} + 2 + ${#_cl_degraded_count} + 12 ))  # "  [Degraded: ]" = 14 visible + count
+                        local _cl_pad=$(( 66 - _cl_vis_len ))
+                        [[ $_cl_pad -lt 2 ]] && _cl_pad=2
+                        printf "%${_cl_pad}s" ""
+                        printf "${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
+                            "$cluster_state" "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
                     else
                         printf "   ${WHITE}${connector}${NC} ${YELLOW}%-4s${NC} ${MAGENTA}%-52s${NC}  ${state_color}%-12s${NC} ${WHITE}%-10s${NC} ${GRAY}%-6s${NC} ${WHITE}%5s${NC} %7s %5s  ${YELLOW}%s${NC}\n" \
                             "$gid" "$cluster_name" "$cluster_state" "$_cl_date" "$_cl_age" "$cluster_size" "" "" "$cluster_ocid"
