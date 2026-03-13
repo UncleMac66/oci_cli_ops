@@ -430,7 +430,7 @@ _oci_throttle() {
 }
 
 # Script directory and cache paths
-readonly SCRIPT_VERSION="3.30.10"
+readonly SCRIPT_VERSION="3.30.11"
 readonly SCRIPT_VERSION_DATE="2026-03-13"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CACHE_DIR="${SCRIPT_DIR}/cache"
@@ -9200,7 +9200,7 @@ list_maintenance_events() {
     [[ "$me_link_announcements" == "true" ]] && _ann_status="${GREEN}ON${NC}"
     echo -e "${GRAY}View: ${WHITE}${me_view_mode}${NC} ${GRAY}(type 'view' to toggle)  Announcements: ${_ann_status} ${GRAY}(type 'ann' to toggle)${NC}"
     case "$filter_type" in
-        named)       echo -e "${YELLOW}Filter: Named instances with unhealthy host health${NC}" ;;
+        named)       echo -e "${YELLOW}Filter: SCHEDULED events — named instances with unhealthy host health${NC}" ;;
         PROCESSING)  echo -e "${YELLOW}Filter: Showing only PROCESSING events${NC}" ;;
         SUCCEEDED)   echo -e "${YELLOW}Filter: Showing only SUCCEEDED events${NC}" ;;
         CANCELED)    echo -e "${YELLOW}Filter: Showing only CANCELED events${NC}" ;;
@@ -9409,6 +9409,8 @@ list_maintenance_events() {
 
         # Apply same filters as the events display table
         if [[ "$filter_type" == "named" ]]; then
+            # Default filter: only SCHEDULED events with named instances on non-healthy hosts
+            [[ "${_filt_lifecycle^^}" != "SCHEDULED" ]] && continue
             local _filt_inst_info="${_ME_INST[$_filt_inst_id]:-}"
             local _filt_inst_name=""
             [[ -n "$_filt_inst_info" ]] && _filt_inst_name="${_filt_inst_info%%|*}"
@@ -13497,8 +13499,8 @@ display_gpu_management_menu() {
                         local _cl_maint_count=0
                         while IFS='|' read -r _mc_inst _mc_cid _mc_cname; do
                             [[ "$_mc_cname" == "$cluster_name" ]] || continue
-                            # Check if this instance has a maintenance event
-                            if jq -e --arg iid "$_mc_inst" '.data[] | select(.["instance-id"] == $iid)' "$MAINT_EVENTS_CACHE" >/dev/null 2>&1; then
+                            # Count only SCHEDULED maintenance events (matches o3 display)
+                            if jq -e --arg iid "$_mc_inst" '.data[] | select(.["instance-id"] == $iid and .["lifecycle-state"] == "SCHEDULED")' "$MAINT_EVENTS_CACHE" >/dev/null 2>&1; then
                                 ((_cl_maint_count++))
                             fi
                         done < "$INSTANCE_CLUSTER_MAP_CACHE"
