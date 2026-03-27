@@ -1,5 +1,5 @@
 #!/bin/bash
-#
+# Mac made a change here!
 # oci_cli_ops.sh - OCI CLI Operations Management Tool
 #
 # Description:
